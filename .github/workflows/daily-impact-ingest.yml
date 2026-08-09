@@ -1,0 +1,140 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Daily Impact Ingest
+
+# Single source of truth for the North Star ratchet + impact metrics.
+# Pulls daily numbers from NPM + GitHub + dev.to, upserts into Supabase,
+# then calls refresh_storefront_ratchet() to advance the North Star. All
+# consumer apps (apps/blog, apps/interlace-landing, downstream eslint-repo
+# docs site) read from the v_* views — only this workflow writes. The
+# control-room boundary lives here.
+#
+# Required repo secrets (configure once at
+# https://github.com/ofri-peretz/impact-ingest/settings/secrets/actions):
+#   SUPABASE_URL              — https://<project-ref>.supabase.co
+#   SUPABASE_SERVICE_ROLE_KEY — full-access JWT; never exposed to frontend
+#   DEVTO_API_KEY             — generate at https://dev.to/settings/extensions;
+#                                rotate when needed; daily-ingest skips
+#                                dev.to gracefully if missing/expired
+# Optional repo secret (collector skips gracefully if missing):
+#   POSTHOG_API_KEY           — personal API key (phx_...). Generate at
+#                                https://us.posthog.com → Settings →
+#                                Personal API Keys. Read-only scope is enough.
+# GITHUB_TOKEN is provided automatically by GHA — no action needed.
+
+on:
+  schedule:
+    - cron: "0 5 * * *" # 05:00 UTC daily
+  workflow_dispatch:
+
+concurrency:
+  group: daily-impact-ingest
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # Required so the on-failure step can open / comment on a ci-failure issue.
+  issues: write
+
+jobs:
+  ingest:
+    name: Ingest into Supabase
+    runs-on: ubuntu-latest
+    # Capped at 7 min: last observed successful run was 2m41s. Headroom
+    # for 2-3× plugin-catalog growth before the linear npm loop bites.
+    # If runs creep past 5 min, parallelize the npm loop (chunked
+    # Promise.all w/ concurrency limit) before bumping this cap.
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+      # `npm install` instead of `npm ci`: the lockfile is generated on
+      # macOS dev machines and misses Linux-only optional deps
+      # (@emnapi/core@1.10.0 etc.), which makes ci fail. `npm install`
+      # drift-corrects on the runner; deterministic enough for this job.
+      - run: npm install --no-audit --no-fund --include=optional
+      - name: Run daily ingest
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEVTO_API_KEY: ${{ secrets.DEVTO_API_KEY }}
+          # PostHog page-views collector. Skips gracefully if
+          # POSTHOG_API_KEY isn't set; card stays hidden via the
+          # scorecard zero-row filter.
+          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          POSTHOG_PROJECT_ID: "428927"
+          POSTHOG_HOST: https://us.i.posthog.com
+          # Outbound dev.to comment count. The private repo read this from the
+          # engagement audit file; that file names who we commented on and
+          # quotes every comment, so only the count crosses over. Unset is
+          # stored as a gap, never as a zero.
+          DEVTO_COMMENTS_LEFT: ${{ vars.DEVTO_COMMENTS_LEFT }}
+        run: npm run ingest
+
+      # Refresh the TRUE all-time npm download total (npm /downloads/range,
+      # ≤18-month window per package, network-resilient). Writes
+      # npm_alltime_downloads + re-runs refresh_storefront_ratchet so
+      # eng_downloads_cumulative reflects all-time across all tracked
+      # packages, not the drift-prone running counter. Non-fatal under npm
+      # 429s (skips windows; the monotonic ratchet floors the cumulative).
+      - name: Refresh all-time npm downloads
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: npm run alltime
+
+      # Same call footprint/scripts/datasync.sh already makes manually —
+      # this is the missing automated half. Without it, freshness is
+      # bounded by the blog's 12h unstable_cache TTL instead of "as fast
+      # as the cron". Requires REVALIDATE_SECRET as a repo secret (not yet
+      # set as of this PR — see PR description). Non-fatal: a missed
+      # invalidation just falls back to the 12h TTL, same as today.
+      - name: Invalidate blog cache
+        if: success()
+        env:
+          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+        run: |
+          if [ -z "$REVALIDATE_SECRET" ]; then
+            echo "::warning::REVALIDATE_SECRET not set — skipping cache invalidation, blog stays on its 12h TTL"
+            exit 0
+          fi
+          curl -sf -X POST -H "Authorization: Bearer ${REVALIDATE_SECRET}" \
+            https://ofriperetz.dev/api/revalidate-tag \
+            || echo "::warning::cache invalidation call failed (non-fatal, 12h TTL still applies)"
+
+      # Unattended cron — silent failures are dangerous. Auto-open (or
+      # comment on existing) a GitHub issue tagged `ci-failure` so we
+      # get the email notification + a persistent visible record.
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `[CI failure] ${context.workflow} — ${context.ref}`;
+            const body = [
+              `Workflow **${context.workflow}** failed.`,
+              ``,
+              `- Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              `- Trigger: ${context.eventName}`,
+              `- SHA: ${context.sha}`,
+            ].join('\n');
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'ci-failure',
+            });
+            const hit = existing.find(i => i.title === title);
+            if (hit) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: hit.number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ['ci-failure'],
+              });
+            }

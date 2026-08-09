@@ -1,0 +1,21 @@
+{
+  "name": "impact-ingest",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Daily npm + GitHub + dev.to metrics ingest behind the public numbers on ofriperetz.dev and the Interlace docs sites",
+  "scripts": {
+    "ingest": "tsx scripts/daily-ingest.ts",
+    "alltime": "tsx scripts/backfill-npm-alltime.ts",
+    "catalog:dry": "tsx scripts/plugin-catalog.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.46.1"
+  },
+  "devDependencies": {
+    "@types/node": "25.7.0",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3"
+  }
+}

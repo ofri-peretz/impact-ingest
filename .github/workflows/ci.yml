@@ -1,0 +1,33 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: CI
+
+# Both jobs are free here (public repo, GitHub-hosted runners) and neither
+# touches a secret, so fork PRs run them safely.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - run: npm install --no-audit --no-fund
+
+      # The private repo this was extracted from has `"include": []` in its
+      # tsconfig, so it compiled zero files and these scripts were never
+      # actually typechecked. Two real defects surfaced the moment they were —
+      # keep this job honest.
+      - run: npm run typecheck
+
+      # Hits npm only: no database, no secrets. Asserts the counted set still
+      # resolves, both renames survive, and nothing on the ignore list leaks in.
+      - run: npm run catalog:dry
