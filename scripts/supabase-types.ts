@@ -403,18 +403,21 @@ export type Database = {
       }
       npm_alltime_downloads: {
         Row: {
+          first_download_on: string | null
           alltime_total: number
           ingest_run_id: string | null
           measured_on: string
           plugin_id: number
         }
         Insert: {
+          first_download_on?: string | null
           alltime_total: number
           ingest_run_id?: string | null
           measured_on?: string
           plugin_id: number
         }
         Update: {
+          first_download_on?: string | null
           alltime_total?: number
           ingest_run_id?: string | null
           measured_on?: string
@@ -722,6 +725,7 @@ export type Database = {
       }
       v_npm_alltime_ecosystem: {
         Row: {
+          measured_since: string | null
           ecosystem_alltime: number | null
           last_measured_on: string | null
           packages_measured: number | null

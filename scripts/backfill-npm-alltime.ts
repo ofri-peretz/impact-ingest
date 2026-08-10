@@ -13,11 +13,23 @@ const sleep = (ms: number): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
 const iso = (d: Date): string => d.toISOString().slice(0, 10);
 
-async function alltime(pkg: string): Promise<number> {
+interface AlltimeResult {
+  total: number;
+  /**
+   * First day this package recorded a non-zero download, or null if it never
+   * has. This is what lets a surface say "all-time" and be able to back it:
+   * the window travels with the number instead of each site hardcoding a date
+   * and drifting from the others.
+   */
+  firstDownloadOn: string | null;
+}
+
+async function alltime(pkg: string): Promise<AlltimeResult> {
   const enc = encodeURIComponent(pkg);
   const end = new Date(iso(new Date()));
   let cursor = new Date("2025-01-01"); // all packages first published Nov/Dec 2025; npm range cap is 18mo
   let total = 0;
+  let firstDownloadOn: string | null = null;
   while (cursor <= end) {
     const we = new Date(cursor);
     we.setFullYear(we.getFullYear() + 1);
@@ -37,9 +49,16 @@ async function alltime(pkg: string): Promise<number> {
         );
         if (r.ok) {
           const b = (await r.json()) as {
-            downloads?: Array<{ downloads: number }>;
+            downloads?: Array<{ downloads: number; day: string }>;
           };
-          total += (b.downloads ?? []).reduce((x, d) => x + d.downloads, 0);
+          const days = b.downloads ?? [];
+          total += days.reduce((x, d) => x + d.downloads, 0);
+          // Windows are walked oldest-first and each is scanned in order, so
+          // the first non-zero day seen is the earliest one overall. Recorded
+          // once and never overwritten.
+          if (firstDownloadOn === null) {
+            firstDownloadOn = days.find((d) => d.downloads > 0)?.day ?? null;
+          }
           ok = true;
         } else if (r.status === 404) {
           ok = true; // package didn't exist in this window
@@ -57,7 +76,7 @@ async function alltime(pkg: string): Promise<number> {
     cursor = new Date(sliceEnd.getTime() + 86_400_000);
     await sleep(300);
   }
-  return total;
+  return { total, firstDownloadOn };
 }
 
 async function main(): Promise<void> {
@@ -67,21 +86,33 @@ async function main(): Promise<void> {
   if (error || !plugins) throw new Error(`plugins: ${error?.message}`);
 
   let eco = 0;
+  let ecoSince: string | null = null;
   for (let i = 0; i < plugins.length; i += 1) {
     if (i > 0) await sleep(300);
     const p = plugins[i]!;
-    const t = await alltime(p.name);
+    const { total: t, firstDownloadOn } = await alltime(p.name);
     eco += t;
-    console.log(`[alltime] ${p.name} = ${t.toLocaleString()}`);
+    if (firstDownloadOn && (!ecoSince || firstDownloadOn < ecoSince))
+      ecoSince = firstDownloadOn;
+    console.log(
+      `[alltime] ${p.name} = ${t.toLocaleString()} (since ${firstDownloadOn ?? "never"})`,
+    );
     const { error: upErr } = await supabaseAdmin
       .from("npm_alltime_downloads")
       .upsert(
-        { plugin_id: p.id, measured_on: iso(new Date()), alltime_total: t },
+        {
+          plugin_id: p.id,
+          measured_on: iso(new Date()),
+          alltime_total: t,
+          first_download_on: firstDownloadOn,
+        },
         { onConflict: "plugin_id" },
       );
     if (upErr) throw new Error(`upsert ${p.name}: ${upErr.message}`);
   }
-  console.log(`[alltime] ecosystem total = ${eco.toLocaleString()}`);
+  console.log(
+    `[alltime] ecosystem total = ${eco.toLocaleString()} since ${ecoSince ?? "unknown"}`,
+  );
 
   const { error: rpc } = await supabaseAdmin.rpc("refresh_storefront_ratchet");
   if (rpc) throw new Error(`refresh: ${rpc.message}`);
