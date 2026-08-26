@@ -8,6 +8,7 @@
     "ingest": "tsx scripts/daily-ingest.ts",
     "alltime": "tsx scripts/backfill-npm-alltime.ts",
     "catalog:dry": "tsx scripts/plugin-catalog.ts",
+    "check": "tsx scripts/daily-ingest.check.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
