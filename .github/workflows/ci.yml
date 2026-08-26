@@ -31,3 +31,8 @@ jobs:
       # Hits npm only: no database, no secrets. Asserts the counted set still
       # resolves, both renames survive, and nothing on the ignore list leaks in.
       - run: npm run catalog:dry
+
+      # Pure-function lock (no network, no DB, no secrets): npm download rows
+      # are keyed by npm's own day, never the run date — the carry-forward
+      # that flatlined plugin_daily_metrics on 2026-08-10..19 stays dead.
+      - run: npm run check

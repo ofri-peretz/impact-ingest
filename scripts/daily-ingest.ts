@@ -13,6 +13,11 @@
 
 import { supabaseAdmin, type Tables } from "./_supabase-admin.js";
 import {
+  computeNpmDailyRows,
+  trailingIdenticalDays,
+  type NpmRangeDay,
+} from "./npm-daily.js";
+import {
   trackedPackages,
   fetchCatalog,
   IGNORED_PACKAGES,
@@ -117,64 +122,41 @@ async function fetchNpm(pkg: string, period: Period): Promise<number | null> {
   return data.downloads;
 }
 
-// Downloads for many packages in as few requests as possible.
-//
-// npm's point endpoint accepts a comma-joined list and answers with an object
-// keyed by package name (entries can be null for a package with no data).
-// Scoped names are rejected from bulk lookups, so they're fetched one at a
-// time — there are only four, and they're the low-traffic ones.
-//
-// A missing key means "npm didn't say", which callers store as null rather
-// than 0: a zero would be indistinguishable from a real zero-download day and
-// would drag the ratchet's daily delta down with fabricated data.
-const NPM_BULK_LIMIT = 100;
+// How many trailing days each run (re)writes into plugin_daily_metrics,
+// keyed by npm's own day. 30 covers any npm stats stall shorter than a month
+// and silently repairs the 2026-08-10..19 carry-forward window on the first
+// run after this ships — no separate one-off backfill needed.
+const NPM_BACKFILL_DAYS = 30;
+// Fetch 30 extra days so the oldest rewritten day still has a full
+// trailing-30 window to sum its d30 from.
+const NPM_FETCH_DAYS = NPM_BACKFILL_DAYS + 30;
 
-async function fetchNpmMany(
-  packages: string[],
-  period: Period,
-): Promise<Record<string, number | null>> {
-  const out: Record<string, number | null> = {};
-  const scoped = packages.filter((n) => n.startsWith("@"));
-  const bulk = packages.filter((n) => !n.startsWith("@"));
-
-  for (let i = 0; i < bulk.length; i += NPM_BULK_LIMIT) {
-    const chunk = bulk.slice(i, i + NPM_BULK_LIMIT);
-    if (i > 0) await sleep(250);
-    const r = await fetch(
-      `https://api.npmjs.org/downloads/point/${period}/${chunk.join(",")}`,
-      { headers: { "User-Agent": NPM_USER_AGENT, Accept: "application/json" } },
+// Per-day downloads for one package. The point endpoint ("last-day") answers
+// with the most recent day npm has COLLECTED — not the most recent calendar
+// day — so it cannot say WHICH day its number belongs to without reading the
+// response's start/end, and under a pipeline stall it repeats the same stale
+// answer for days. The range endpoint keys every value by its own day, which
+// is the only honest input for a table keyed by observed_on. Range has no
+// bulk form, so this is one paced call per package.
+async function fetchNpmRange(pkg: string): Promise<NpmRangeDay[] | null> {
+  const end = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+  const start = new Date(Date.now() - NPM_FETCH_DAYS * 86_400_000)
+    .toISOString()
+    .slice(0, 10);
+  const r = await fetch(
+    `https://api.npmjs.org/downloads/range/${start}:${end}/${encodeURIComponent(pkg)}`,
+    { headers: { "User-Agent": NPM_USER_AGENT, Accept: "application/json" } },
+  );
+  if (!r.ok) {
+    // Same non-fatal contract as fetchNpm: the ratchet is monotonic and the
+    // cron runs daily, so a lost package costs one cosmetic data point.
+    console.error(
+      `[ingest] warn: npm range ${pkg} → ${r.status} (skipped, non-fatal)`,
     );
-    if (!r.ok) {
-      // Same non-fatal contract as fetchNpm: the ratchet is monotonic and the
-      // cron runs daily, so a lost period costs one cosmetic data point.
-      console.error(
-        `[ingest] warn: npm bulk ${period} ×${chunk.length} → ${r.status} (skipped, non-fatal)`,
-      );
-      continue;
-    }
-    // A single-package chunk answers with the bare point object, not a map —
-    // the one shape difference in this endpoint, and the reason a chunk of one
-    // would otherwise silently record nothing.
-    const json = (await r.json()) as
-      | NpmDownloadsPoint
-      | Record<string, NpmDownloadsPoint | null>;
-    if (chunk.length === 1) {
-      out[chunk[0]!] = (json as NpmDownloadsPoint).downloads ?? null;
-      continue;
-    }
-    for (const [name, point] of Object.entries(
-      json as Record<string, NpmDownloadsPoint | null>,
-    )) {
-      out[name] = point?.downloads ?? null;
-    }
+    return null;
   }
-
-  for (const name of scoped) {
-    await sleep(250);
-    out[name] = await fetchNpm(name, period);
-  }
-
-  return out;
+  const body = (await r.json()) as { downloads?: NpmRangeDay[] };
+  return body.downloads ?? [];
 }
 
 async function ghHeaders(): Promise<Record<string, string>> {
@@ -839,47 +821,99 @@ async function main(): Promise<void> {
       );
     }
 
-    // NPM downloads → plugin_daily_metrics, three periods per package.
+    // NPM downloads → plugin_daily_metrics, one RANGE call per package.
     //
-    // Pacing alone never solved this. The serial 250ms-spaced loop it replaces
-    // still lost 32 of 72 calls to 429s at 24 packages (run 31297231307), and
-    // 66 of 108 at 36 — 21 packages recorded nothing at all. Slowing down
-    // further only widens the window npm counts requests in.
+    // Until 2026-08-26 this stamped point/last-day answers on the RUN date.
+    // npm's stats pipeline lags 24–48h and stalled for a week in mid-August;
+    // "last-day" kept answering with the last-collected day, so seven
+    // consecutive observed_on dates (2026-08-10..16) got byte-identical
+    // values and the /loom weekly rollup showed a crash that never happened.
     //
-    // The fix is to ask fewer times: the point endpoint takes a comma-joined
-    // list, so all unscoped packages come back in ONE call per period. That's
-    // 108 requests → 3 bulk + 12 scoped. Scoped names can't ride along
-    // ("scoped packages are not currently supported in bulk lookups"), so the
-    // four @interlace/* ones stay individual, still paced.
-    const names = (plugins as PluginRow[]).map((p) => p.name);
-    const [d1By, d7By, d30By] = [
-      await fetchNpmMany(names, "last-day"),
-      await fetchNpmMany(names, "last-week"),
-      await fetchNpmMany(names, "last-month"),
-    ];
-
+    // Now each run rewrites the trailing NPM_BACKFILL_DAYS days with
+    // npm-authoritative per-day values keyed by npm's OWN day: lagging days
+    // fill in once npm collects them, and a stalled upstream produces no row
+    // instead of a wrong one. Re-writing collected days is a no-op — npm
+    // does not revise download history — so the upsert stays idempotent.
+    //
+    // Request math: range has no bulk form, so this is 1 paced call per
+    // package (36 today) vs the point endpoint's 3 bulk + 12 scoped. The
+    // pre-extraction agents repo ran this exact shape with zero rate-limit
+    // losses; 250ms pacing + the real User-Agent keep it under npm's per-IP
+    // limit.
     let dailySum = 0;
+    let latestNpmDay: string | null = null;
+    let pluginIndex = 0;
     for (const p of plugins as PluginRow[]) {
-      const d1 = d1By[p.name] ?? null;
-      const d7 = d7By[p.name] ?? null;
-      const d30 = d30By[p.name] ?? null;
-      console.log(`[npm] ${p.name}  d1=${d1} d7=${d7} d30=${d30}`);
-      dailySum += d1 ?? 0;
+      if (pluginIndex > 0) await sleep(250);
+      pluginIndex += 1;
+      const range = await fetchNpmRange(p.name);
+      if (range === null) continue; // fetch failed — already logged, move on
+      const rows = computeNpmDailyRows(range, NPM_BACKFILL_DAYS);
+      if (rows.length === 0) {
+        console.log(`[npm] ${p.name}  no collected days in window`);
+        continue;
+      }
+      const last = rows[rows.length - 1]!;
+      console.log(
+        `[npm] ${p.name}  ${rows.length}d → ${last.day}  d1=${last.d1} d7=${last.d7} d30=${last.d30}`,
+      );
+      dailySum += last.d1;
+      if (latestNpmDay === null || last.day > latestNpmDay) {
+        latestNpmDay = last.day;
+      }
       const { error: upErr } = await supabaseAdmin
         .from("plugin_daily_metrics")
         .upsert(
-          {
+          rows.map((row) => ({
             plugin_id: p.id,
-            observed_on: today,
-            npm_downloads_d1: d1,
-            npm_downloads_d7: d7,
-            npm_downloads_d30: d30,
+            observed_on: row.day,
+            npm_downloads_d1: row.d1,
+            npm_downloads_d7: row.d7,
+            npm_downloads_d30: row.d30,
             ingest_run_id: runId,
-          },
+          })),
           { onConflict: "plugin_id,observed_on" },
         );
       if (upErr) throw new Error(`upsert ${p.name}: ${upErr.message}`);
-      rowsWritten += 1;
+      rowsWritten += rows.length;
+    }
+
+    // Carry-forward tripwire. The bug above wrote byte-identical per-plugin
+    // values onto consecutive observed_on dates; real per-day downloads never
+    // repeat identically across the whole catalog, so N identical days means
+    // either npm's pipeline is frozen or a regression reintroduced
+    // run-date stamping. Non-fatal: ::warning:: lands on the run summary.
+    {
+      const lookback = new Date(Date.now() - 6 * 86_400_000)
+        .toISOString()
+        .slice(0, 10);
+      const { data: recent } = await supabaseAdmin
+        .from("plugin_daily_metrics")
+        .select("observed_on, plugin_id, npm_downloads_d1")
+        .gte("observed_on", lookback);
+      const byDate = new Map<string, string[]>();
+      for (const r of recent ?? []) {
+        const list = byDate.get(r.observed_on) ?? [];
+        list.push(`${r.plugin_id}:${r.npm_downloads_d1}`);
+        byDate.set(r.observed_on, list);
+      }
+      const fingerprints = [...byDate.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([, vals]) => vals.sort().join(","));
+      const streak = trailingIdenticalDays(fingerprints);
+      if (streak >= 3) {
+        console.error(
+          `::warning::plugin_daily_metrics holds ${streak} consecutive days of identical per-plugin npm values — carry-forward regression or npm stats stall`,
+        );
+      }
+      const threeDaysAgo = new Date(Date.now() - 3 * 86_400_000)
+        .toISOString()
+        .slice(0, 10);
+      if (latestNpmDay === null || latestNpmDay < threeDaysAgo) {
+        console.error(
+          `::warning::npm download data is stale — latest collected day is ${latestNpmDay ?? "none"}; missing days fill in when npm's stats pipeline catches up`,
+        );
+      }
     }
 
     // Creator: github-repo (stars), github (followers + commits), devto (totals)
@@ -1358,12 +1392,15 @@ async function main(): Promise<void> {
         (p) => p.name === "eslint-plugin-secure-coding",
       );
       if (secPlugin) {
+        // Rows are keyed to npm's own (lagging) day, so `today` usually has
+        // no row yet — read the latest collected one instead.
         const d30Row = await supabaseAdmin
           .from("plugin_daily_metrics")
           .select("npm_downloads_d30")
           .eq("plugin_id", secPlugin.id)
-          .eq("observed_on", today)
-          .single();
+          .order("observed_on", { ascending: false })
+          .limit(1)
+          .maybeSingle();
         const d30 = d30Row.data?.npm_downloads_d30 ?? 0;
         if (d30 > 0) {
           const vs = await fetchNpmVersionShare(secPlugin.name, d30);
@@ -1399,15 +1436,23 @@ async function main(): Promise<void> {
 
     // 1. Download velocity — week-over-week % change per plugin.
     // Answers: "is the May surge still growing or decaying?"
-    {
+    // Anchored on the latest day npm actually collected, not the run date —
+    // plugin_daily_metrics rows are keyed to npm's own (lagging) day, so
+    // `today` usually has no row and an eq(today) query would compute nothing.
+    if (latestNpmDay !== null) {
+      const npmAnchorMinus7 = new Date(
+        new Date(latestNpmDay).getTime() - 7 * 86400000,
+      )
+        .toISOString()
+        .slice(0, 10);
       const { data: current7 } = await supabaseAdmin
         .from("plugin_daily_metrics")
         .select("plugin_id, npm_downloads_d7")
-        .eq("observed_on", today);
+        .eq("observed_on", latestNpmDay);
       const { data: prior7 } = await supabaseAdmin
         .from("plugin_daily_metrics")
         .select("plugin_id, npm_downloads_d7")
-        .eq("observed_on", sevenDaysAgo);
+        .eq("observed_on", npmAnchorMinus7);
 
       const priorMap = new Map(
         (prior7 ?? []).map((r) => [r.plugin_id, r.npm_downloads_d7 ?? 0]),
