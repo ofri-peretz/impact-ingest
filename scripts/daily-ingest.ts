@@ -11,6 +11,7 @@
 //
 // Runs from .github/workflows/daily-impact-ingest.yml at 05:00 UTC.
 
+import { ingestDevtoWarehouse } from "./devto-warehouse.js";
 import { supabaseAdmin, type Tables } from "./_supabase-admin.js";
 import {
   computeNpmDailyRows,
@@ -921,6 +922,13 @@ async function main(): Promise<void> {
     const ghUser = await fetchGitHubUser();
     const ghCommits = await fetchGitHubCommits();
     const devtoArticles = await fetchAllDevtoArticles();
+    // dev.to warehouse (own-the-data intent): daily analytics, referrers,
+    // followers with account age, inbound comments. Non-fatal by design.
+    try {
+      rowsWritten += await ingestDevtoWarehouse({ today, runId, articles: devtoArticles });
+    } catch (e) {
+      console.error("[devto-warehouse] skipped:", e instanceof Error ? e.message : e);
+    }
     const devtoFollowers = await fetchDevtoFollowers();
     const devto =
       devtoArticles.length > 0
