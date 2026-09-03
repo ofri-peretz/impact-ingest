@@ -8,7 +8,8 @@
     "ingest": "tsx scripts/daily-ingest.ts",
     "alltime": "tsx scripts/backfill-npm-alltime.ts",
     "catalog:dry": "tsx scripts/plugin-catalog.ts",
-    "check": "tsx scripts/daily-ingest.check.ts",
+    "check": "tsx scripts/daily-ingest.check.ts && SUPABASE_URL=https://check.invalid SUPABASE_SERVICE_ROLE_KEY=check tsx scripts/devto-warehouse.check.ts",
+    "devto:backfill": "tsx scripts/devto-warehouse.ts --since 2026-02-23 --followers-all",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
