@@ -8,6 +8,7 @@
  *   tsx scripts/devto-warehouse.ts --since 2026-02-23        # analytics history
  *   tsx scripts/devto-warehouse.ts --followers-all           # every follower, with account age
  *   tsx scripts/devto-warehouse.ts --dry-run                 # print, write nothing
+ *   tsx scripts/devto-warehouse.ts --fill-joined 400         # look up that many unknown account ages
  *
  * Idempotent: every upsert uses the table's natural key. Non-fatal: the
  * caller wraps it, so a dev.to hiccup never costs the rest of the ingest.
@@ -165,6 +166,46 @@ export async function ingestDevtoFollowers(runId: string | null, opts: { all?: b
   return rows.length;
 }
 
+/* ── 3b. fill account ages the first pass could not ───────────────────────── */
+
+/**
+ * The back-fill looked up 403 of 1,884 accounts before dev.to throttled the
+ * profile endpoint; the rest have `joined_on` null, so `onboarding` is null
+ * too — unknown, never assumed. Each run fills a bounded batch, newest first,
+ * at a gentler pace, until none are left. Over days the flag converges.
+ */
+export async function fillFollowerJoinDates(limit = 150, paceMs = 900, dry = false): Promise<number> {
+  const { data } = await db
+    .from("devto_followers")
+    .select("user_id, followed_at")
+    .is("joined_on", null)
+    .order("followed_at", { ascending: false })
+    .limit(limit);
+  const pending = (data ?? []) as { user_id: number; followed_at: string }[];
+  if (pending.length === 0) return 0;
+  let filled = 0;
+  for (const f of pending) {
+    let joined: string | null = null;
+    try {
+      const u = await get<{ joined_at?: string }>(`/users/${f.user_id}`, false);
+      joined = parseJoined(u.joined_at);
+    } catch (e) {
+      // Throttled or gone. Stop the batch on the first failure: hammering a
+      // throttled endpoint only lengthens the throttle.
+      console.log(`[devto-warehouse] join-date fill stopped at ${filled}: ${e instanceof Error ? e.message : e}`);
+      break;
+    }
+    if (joined && !dry) {
+      const { error } = await db.from("devto_followers").update({ joined_on: joined, onboarding: isOnboarding(f.followed_at, joined) }).eq("user_id", f.user_id);
+      if (error) throw new Error(`devto_followers update: ${error.message}`);
+    }
+    filled++;
+    await sleep(paceMs);
+  }
+  console.log(`[devto-warehouse] join dates filled: ${filled} (${pending.length - filled} still unknown in this batch)`);
+  return filled;
+}
+
 /* ── 4. inbound comments on our articles, with our reply if any ───────────── */
 
 interface Node { id_code: string; created_at: string; body_html?: string; user?: { username?: string }; children?: Node[] }
@@ -222,6 +263,8 @@ export async function ingestDevtoWarehouse(opts: {
   articles: { id: number; comments_count?: number }[];
   since?: string;
   followersAll?: boolean;
+  /** How many unknown account ages to look up this run (default 150). */
+  fillJoined?: number;
   dry?: boolean;
 }): Promise<number> {
   const since = opts.since ?? day(new Date(Date.now() - 7 * 86_400_000)); // re-upsert a week: dev.to revises recent days
@@ -229,6 +272,7 @@ export async function ingestDevtoWarehouse(opts: {
   n += await ingestDevtoAnalytics(since, opts.today, opts.runId, opts.dry);
   n += await ingestDevtoReferrers(opts.today, opts.runId, opts.dry);
   n += await ingestDevtoFollowers(opts.runId, { all: opts.followersAll, dry: opts.dry });
+  n += await fillFollowerJoinDates(opts.fillJoined ?? 150, 900, opts.dry);
   n += await ingestDevtoInboundComments(opts.articles, opts.runId, opts.dry);
   return n;
 }
@@ -243,6 +287,7 @@ if (process.argv[1] && /devto-warehouse\.ts$/.test(process.argv[1])) {
     const n = await ingestDevtoWarehouse({
       today, runId: null, articles,
       since: val("--since"), followersAll: args.includes("--followers-all"), dry: args.includes("--dry-run"),
+      fillJoined: val("--fill-joined") ? Number(val("--fill-joined")) : undefined,
     });
     console.log(`[devto-warehouse] done: ${n} row(s)${args.includes("--dry-run") ? " (dry run)" : ""}`);
   })().catch((e) => { console.error(e); process.exit(1); });
