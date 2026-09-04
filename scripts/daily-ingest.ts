@@ -1410,14 +1410,31 @@ async function main(): Promise<void> {
       }
     }
 
-    // Ecosystem daily rollup
-    const { data: prevEco } = await supabaseAdmin
-      .from("ecosystem_daily_metrics")
-      .select("total_npm_downloads")
-      .order("observed_on", { ascending: false })
-      .limit(1);
-    const prevTotal = Number(prevEco?.[0]?.total_npm_downloads ?? 0);
-    const newTotal = prevTotal + dailySum;
+    // Ecosystem daily rollup.
+    //
+    // `total_npm_downloads` is deliberately NOT written here. It used to be
+    // `previous row + today's delta`, seeded from zero on our first
+    // observation, so it silently omitted every download before we started
+    // watching and every day we missed — 22,007 adrift by 2026-09-04, and
+    // plausible enough that nothing flagged it. It now follows
+    // `npm_alltime_downloads`, written by `backfill-npm-alltime.ts` in the
+    // step right after this one. One question, one writer.
+    //
+    // `daily_npm_downloads` stays here: that IS this run's measurement.
+    //
+    // The all-time figure is still READ here, because two things below need a
+    // cumulative total — the download-to-star ratio and the version-share
+    // gate. Reading the accumulator is at worst one run stale (this step runs
+    // before `alltime` refreshes it); the running sum it replaces was 22,007
+    // permanently low and getting worse. A day behind beats a year adrift.
+    const { data: alltimeRows } = await supabaseAdmin
+      .from("npm_alltime_downloads")
+      .select("alltime_total");
+    const alltimeTotal = (alltimeRows ?? []).reduce(
+      (sum, r) => sum + Number(r.alltime_total ?? 0),
+      0,
+    );
+    if (alltimeTotal === 0) degraded.push("npm all-time total");
 
     const { error: eErr } = await supabaseAdmin
       .from("ecosystem_daily_metrics")
@@ -1427,7 +1444,6 @@ async function main(): Promise<void> {
           total_packages: plugins?.length ?? null,
           total_plugins: plugins?.length ?? null,
           ...(ruleCounts ? { total_rules: ruleCounts.totalRules } : {}),
-          total_npm_downloads: newTotal,
           daily_npm_downloads: dailySum,
           test_coverage: repoTotals?.coverage ?? null,
           total_lines: repoTotals?.lines ?? null,
@@ -1441,10 +1457,12 @@ async function main(): Promise<void> {
     if (eErr) throw new Error(`ecosystem upsert: ${eErr.message}`);
     rowsWritten += 1;
 
-    // Download-to-star ratio — written after newTotal is known.
+    // Download-to-star ratio, over the TRUE all-time total.
+    // It was computed from the running sum, so the headline metric in
+    // GROWTH_PHILOSOPHY has been ~4.6% low for as long as the drift existed.
     // The "headline metric" from GROWTH_PHILOSOPHY: lower = more visible community.
-    if (repoStars !== null && repoStars > 0 && newTotal > 0) {
-      const ratio = Math.round(newTotal / repoStars);
+    if (repoStars !== null && repoStars > 0 && alltimeTotal > 0) {
+      const ratio = Math.round(alltimeTotal / repoStars);
       const { error: ratioErr } = await supabaseAdmin
         .from("metric_snapshots")
         .upsert(
@@ -1461,7 +1479,7 @@ async function main(): Promise<void> {
       if (ratioErr)
         console.error(`[computed] ratio upsert: ${ratioErr.message}`);
       console.log(
-        `[computed] downloads_per_star=${ratio} (${newTotal} downloads / ${repoStars} stars)`,
+        `[computed] downloads_per_star=${ratio} (${alltimeTotal} downloads / ${repoStars} stars)`,
       );
     }
 
@@ -1502,7 +1520,7 @@ async function main(): Promise<void> {
 
     // npm version share — latest-version % of d30 for top plugins.
     // Measures upgrade cadence. Only runs for the ecosystem total + top plugin.
-    if (newTotal > 0) {
+    if (alltimeTotal > 0) {
       const secPlugin = (plugins as PluginRow[]).find(
         (p) => p.name === "eslint-plugin-secure-coding",
       );

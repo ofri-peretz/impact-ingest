@@ -114,6 +114,30 @@ async function main(): Promise<void> {
     `[alltime] ecosystem total = ${eco.toLocaleString()} since ${ecoSince ?? "unknown"}`,
   );
 
+  // The ecosystem row's cumulative column FOLLOWS this number instead of
+  // keeping its own running sum.
+  //
+  // It used to be `previous row + today's delta`, seeded from zero on our
+  // first observation — so it silently omitted every download that happened
+  // before we started watching, plus every day we missed. On 2026-09-04 it
+  // read 458,508 against this table's 480,515: 22,007 adrift, 4.6% low, and
+  // plausible enough that nothing flagged it. Every consumer that wanted the
+  // real figure had to know to override it, which engage does in a comment
+  // longer than this one.
+  //
+  // Two numbers answering one question is the bug. This script already
+  // computes `eco` and already logs it, so it is the writer — and being the
+  // only writer is the point. Merge-duplicates touches just this column, so
+  // the ingest's own fields on today's row are left alone.
+  const { error: ecoErr } = await supabaseAdmin
+    .from("ecosystem_daily_metrics")
+    .upsert(
+      { observed_on: iso(new Date()), total_npm_downloads: eco },
+      { onConflict: "observed_on" },
+    );
+  if (ecoErr) throw new Error(`ecosystem total: ${ecoErr.message}`);
+  console.log(`[alltime] ecosystem_daily_metrics.total_npm_downloads = ${eco}`);
+
   const { error: rpc } = await supabaseAdmin.rpc("refresh_storefront_ratchet");
   if (rpc) throw new Error(`refresh: ${rpc.message}`);
   console.log("[ratchet] refreshed");
