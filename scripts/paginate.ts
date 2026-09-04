@@ -39,3 +39,39 @@ export async function collectPaginated<T>(
   // Budget spent without a short page: there is more we did not read.
   return null;
 }
+
+/**
+ * Validate the published plugin-stats document.
+ *
+ * Pure, so the contract can be checked without the network — which is the
+ * whole point, because the interesting branch is the one where the document
+ * is internally inconsistent, and that is not a branch a live fetch of a
+ * healthy file will ever take.
+ *
+ * Returns null on anything unusable. The last guard is the one that earns its
+ * place: a `totalRules` that disagrees with the sum of its own rows is not a
+ * source of truth, and taking a headline number on faith while its own detail
+ * contradicts it is exactly how a wrong figure survives review.
+ */
+export function parseRuleCounts(doc: unknown): {
+  totalRules: number;
+  byPlugin: Map<string, number>;
+} | null {
+  const d = doc as {
+    totalRules?: unknown;
+    plugins?: { name?: unknown; rules?: unknown }[];
+  } | null;
+  if (!d || typeof d.totalRules !== "number" || !Array.isArray(d.plugins)) {
+    return null;
+  }
+  const byPlugin = new Map<string, number>();
+  for (const entry of d.plugins) {
+    if (typeof entry?.name === "string" && typeof entry?.rules === "number") {
+      byPlugin.set(entry.name, entry.rules);
+    }
+  }
+  if (byPlugin.size !== d.plugins.length) return null;
+  const summed = [...byPlugin.values()].reduce((a, b) => a + b, 0);
+  if (summed !== d.totalRules) return null;
+  return { totalRules: d.totalRules, byPlugin };
+}
