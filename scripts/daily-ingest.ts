@@ -11,6 +11,7 @@
 //
 // Runs from .github/workflows/daily-impact-ingest.yml at 05:00 UTC.
 
+import { computeArticleLifts } from "./article-lift.js";
 import { ingestDevtoWarehouse } from "./devto-warehouse.js";
 import { supabaseAdmin, type Tables } from "./_supabase-admin.js";
 import {
@@ -127,7 +128,10 @@ async function fetchNpm(pkg: string, period: Period): Promise<number | null> {
 // keyed by npm's own day. 30 covers any npm stats stall shorter than a month
 // and silently repairs the 2026-08-10..19 carry-forward window on the first
 // run after this ships — no separate one-off backfill needed.
-const NPM_BACKFILL_DAYS = 30;
+// Override once for a long repair: NPM_BACKFILL_DAYS=130 npm run ingest.
+// The cron was silent 2026-07-19..08-25 and the 30-day window never reached
+// back into it (read 2026-09-04: one to five plugins per day for five weeks).
+const NPM_BACKFILL_DAYS = Number(process.env.NPM_BACKFILL_DAYS) || 30;
 // Fetch 30 extra days so the oldest rewritten day still has a full
 // trailing-30 window to sum its d30 from.
 const NPM_FETCH_DAYS = NPM_BACKFILL_DAYS + 30;
@@ -1595,114 +1599,9 @@ async function main(): Promise<void> {
       }
     }
 
-    // 4. Article-to-download correlation — for each article published 8–38
-    // days ago, compare average d7 downloads in the 7 days before vs after
-    // publish. Writes the delta so we can see if content drives installs.
-    // Only runs for articles with a matching plugin tag.
-    {
-      const tagToPlugin: Record<string, string> = {
-        "secure-coding": "eslint-plugin-secure-coding",
-        "node-security": "eslint-plugin-node-security",
-        "import-next": "eslint-plugin-import-next",
-        jwt: "eslint-plugin-jwt",
-        "lambda-security": "eslint-plugin-lambda-security",
-        "express-security": "eslint-plugin-express-security",
-        pg: "eslint-plugin-pg",
-      };
-
-      // Articles published 8–38 days ago (need 7-day pre and post windows)
-      const windowStart = new Date(Date.now() - 38 * 86400000)
-        .toISOString()
-        .slice(0, 10);
-      const windowEnd = new Date(Date.now() - 8 * 86400000)
-        .toISOString()
-        .slice(0, 10);
-      const { data: articles } = await supabaseAdmin
-        .from("external_articles")
-        .select("slug, title, published_at, payload")
-        .eq("source", "devto")
-        .gte("published_at", windowStart)
-        .lte("published_at", windowEnd);
-
-      for (const article of articles ?? []) {
-        const pubDate = article.published_at?.slice(0, 10);
-        if (!pubDate) continue;
-        // external_articles.slug is nullable, and it's the `dimension` this
-        // loop keys its metric_snapshots row on — a null would write a row
-        // nothing can ever look up again.
-        if (!article.slug) continue;
-
-        // Infer which plugin this article is about from its tags
-        const tags: string[] = (
-          (article.payload as { tag_list?: string[] })?.tag_list ?? []
-        ).map((t: string) => t.toLowerCase());
-        const matchedPluginName = Object.entries(tagToPlugin).find(([tag]) =>
-          tags.some((t) => t.includes(tag)),
-        )?.[1];
-        if (!matchedPluginName) continue;
-
-        const plugin = (plugins as PluginRow[]).find(
-          (p) => p.name === matchedPluginName,
-        );
-        if (!plugin) continue;
-
-        // 7-day window before publish
-        const prePubStart = new Date(new Date(pubDate).getTime() - 7 * 86400000)
-          .toISOString()
-          .slice(0, 10);
-        const postPubEnd = new Date(new Date(pubDate).getTime() + 7 * 86400000)
-          .toISOString()
-          .slice(0, 10);
-
-        const { data: preRows } = await supabaseAdmin
-          .from("plugin_daily_metrics")
-          .select("npm_downloads_d1")
-          .eq("plugin_id", plugin.id)
-          .gte("observed_on", prePubStart)
-          .lt("observed_on", pubDate);
-
-        const { data: postRows } = await supabaseAdmin
-          .from("plugin_daily_metrics")
-          .select("npm_downloads_d1")
-          .eq("plugin_id", plugin.id)
-          .gt("observed_on", pubDate)
-          .lte("observed_on", postPubEnd);
-
-        const avg = (rows: typeof preRows) => {
-          const vals = (rows ?? [])
-            .map((r) => r.npm_downloads_d1 ?? 0)
-            .filter((v) => v > 0);
-          return vals.length > 0
-            ? Math.round(vals.reduce((s, v) => s + v, 0) / vals.length)
-            : null;
-        };
-
-        const preAvg = avg(preRows);
-        const postAvg = avg(postRows);
-        if (preAvg === null || postAvg === null || preAvg === 0) continue;
-
-        const lift = Math.round(((postAvg - preAvg) / preAvg) * 100);
-        const { error: liftErr } = await supabaseAdmin
-          .from("metric_snapshots")
-          .upsert(
-            {
-              source: "computed",
-              kind: "article_download_lift_pct",
-              dimension: article.slug,
-              observed_on: today,
-              value: lift,
-              ingest_run_id: runId,
-            },
-            { onConflict: "source,kind,dimension,observed_on" },
-          );
-        if (liftErr)
-          console.error(`[article-lift] ${article.slug}: ${liftErr.message}`);
-        else
-          console.log(
-            `[article-lift] ${article.slug} → ${matchedPluginName.replace("eslint-plugin-", "")}: pre=${preAvg} post=${postAvg} lift=${lift}%`,
-          );
-      }
-    }
+    // 4. Article → npm download lift, 8–38 days back so both seven-day
+    //    windows exist. Matcher and arithmetic live in article-lift.ts.
+    rowsWritten += await computeArticleLifts({ today, runId, sinceDays: 38 });
 
     const { error: rpcErr } = await supabaseAdmin.rpc(
       "refresh_storefront_ratchet",
