@@ -23,6 +23,7 @@
  */
 import assert from "node:assert/strict";
 
+import { collectPaginated } from "./paginate.js";
 import {
   computeNpmDailyRows,
   trailingIdenticalDays,
@@ -125,3 +126,83 @@ function series(
 }
 
 console.log("daily-ingest.check ✓ npm per-day contract holds");
+
+// ── 6. A partial page-walk is not a count ───────────────────────────────────
+//
+// The shape this replaces returned `total > 0 ? total : null`, so it failed
+// safe ONLY when page one failed. A failure on page two or later produced a
+// confident undercount that landed in a daily series, indistinguishable from
+// a real dip — the more data there was, the more likely a hiccup lied.
+//
+// Positive control first: a walk that completes must still return the items,
+// or every assertion below passes for the wrong reason.
+{
+  const pages = (...batches: number[][]) => {
+    const calls: number[] = [];
+    return {
+      calls,
+      fetchPage: async (page: number) => {
+        calls.push(page);
+        return batches[page - 1] ?? [];
+      },
+    };
+  };
+
+  // 1. Completes: two full pages then a short one.
+  {
+    const full = Array.from({ length: 3 }, (_, i) => i);
+    const { fetchPage } = pages(full, full, [9]);
+    const out = await collectPaginated(fetchPage, { perPage: 3, maxPages: 10 });
+    assert.equal(out?.length, 7, "a completed walk returns every item");
+  }
+
+  // 2. A failed page yields null, NOT the pages already read.
+  {
+    const full = [1, 2, 3];
+    const out = await collectPaginated(
+      async (page) => (page === 2 ? null : full),
+      { perPage: 3, maxPages: 10 },
+    );
+    assert.equal(out, null, "a failure mid-walk is unknown, not a partial sum");
+  }
+
+  // 3. Failing on page ONE is the case the old code got right; it must stay
+  //    right, so the fix is not just moving the bug.
+  {
+    const out = await collectPaginated(async () => null, {
+      perPage: 3,
+      maxPages: 10,
+    });
+    assert.equal(out, null, "a failure on the first page is unknown");
+  }
+
+  // 4. Budget exhausted with a full final page: there is more we did not read,
+  //    so the count is unknown. The old loop returned the truncated total.
+  {
+    const out = await collectPaginated(async () => [1, 2, 3], {
+      perPage: 3,
+      maxPages: 3,
+    });
+    assert.equal(out, null, "an exhausted page budget is unknown, not a total");
+  }
+
+  // 5. A genuine zero survives as zero. `total > 0 ? total : null` turned an
+  //    empty first page into "unknown", which is the same class of error in
+  //    the other direction — a real value reported as absent.
+  {
+    const out = await collectPaginated(async () => [], {
+      perPage: 100,
+      maxPages: 5,
+    });
+    assert.deepEqual(out, [], "an empty first page is a complete walk of zero");
+  }
+
+  // 6. It stops at the short page rather than paging forever.
+  {
+    const { calls, fetchPage } = pages([1, 2, 3], [4]);
+    await collectPaginated(fetchPage, { perPage: 3, maxPages: 50 });
+    assert.deepEqual(calls, [1, 2], "stops on the first short page");
+  }
+
+  console.log("✓ collectPaginated: a partial walk reports unknown, not a total");
+}
