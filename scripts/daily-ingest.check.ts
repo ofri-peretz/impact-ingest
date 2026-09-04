@@ -22,6 +22,9 @@
  * Pure functions only — no network, no database, no secrets.
  */
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { collectPaginated, parseRuleCounts } from "./paginate.js";
 import {
@@ -261,4 +264,51 @@ console.log("daily-ingest.check ✓ npm per-day contract holds");
   assert.deepEqual(parseRuleCounts(doc(0, []))?.totalRules, 0);
 
   console.log("✓ parseRuleCounts: a headline must agree with its own rows");
+}
+
+// ── 8. One question, one writer: the cumulative total follows the accumulator ─
+//
+// These are STRUCTURAL assertions and they read source text, which is the
+// right evidence for a claim about which file writes a column — but it is a
+// claim about wiring, not behaviour, and the name says so.
+//
+// What they prevent: `ecosystem_daily_metrics.total_npm_downloads` used to be
+// `previous row + today's delta`, seeded from zero on our first observation.
+// It therefore omitted every download from before we started watching and
+// every day we missed — 22,007 low by 2026-09-04, 4.6%, and plausible enough
+// that nothing flagged it for months. `npm_alltime_downloads` measures the
+// real thing. Two numbers answering one question is the defect; a second
+// writer reappearing is how it comes back.
+{
+  const here = dirname(fileURLToPath(import.meta.url));
+  const read = (f: string) => readFileSync(join(here, f), "utf-8");
+  const ingest = read("daily-ingest.ts");
+  const alltime = read("backfill-npm-alltime.ts");
+
+  // Positive control: the accumulator's owner really does write the column.
+  // Without this the assertion below passes just as well if NOBODY writes it.
+  assert.match(
+    alltime,
+    /from\("ecosystem_daily_metrics"\)[\s\S]{0,200}total_npm_downloads/,
+    "backfill-npm-alltime must write ecosystem_daily_metrics.total_npm_downloads",
+  );
+
+  // The ingest must not write it. Scoped to its ecosystem upsert rather than
+  // the whole file, so the READ it still does for the ratio stays legal.
+  const ecoUpsert = ingest.slice(
+    ingest.indexOf('.from("ecosystem_daily_metrics")\n      .upsert('),
+  ).slice(0, 900);
+  assert.ok(ecoUpsert.length > 100, "found the ecosystem upsert to inspect");
+  assert.ok(
+    !ecoUpsert.includes("total_npm_downloads"),
+    "daily-ingest must NOT write total_npm_downloads; the accumulator owns it",
+  );
+
+  // And the self-accumulating shape itself is gone, in any spelling.
+  assert.ok(
+    !/prevTotal|newTotal/.test(ingest),
+    "the running-sum variables are gone, not merely unused",
+  );
+
+  console.log("✓ total_npm_downloads: written by the accumulator, and only there");
 }
