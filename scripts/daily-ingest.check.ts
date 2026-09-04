@@ -23,7 +23,7 @@
  */
 import assert from "node:assert/strict";
 
-import { collectPaginated } from "./paginate.js";
+import { collectPaginated, parseRuleCounts } from "./paginate.js";
 import {
   computeNpmDailyRows,
   trailingIdenticalDays,
@@ -205,4 +205,60 @@ console.log("daily-ingest.check ✓ npm per-day contract holds");
   }
 
   console.log("✓ collectPaginated: a partial walk reports unknown, not a total");
+}
+
+// ── 7. A headline that disagrees with its own rows is not a source of truth ──
+//
+// `total_rules` was null for 175 days and `rule_count` for every plugin on
+// every day, while the control room rendered both. Filling them from the
+// published plugin-stats document is only an improvement if the document is
+// checked — a number taken on faith while its own detail contradicts it is
+// how a wrong figure survives review.
+{
+  const doc = (totalRules: number, plugins: unknown[]) => ({
+    totalRules,
+    plugins,
+  });
+
+  // Positive control first: a consistent document parses, and the map is
+  // keyed the way the caller looks it up.
+  {
+    const out = parseRuleCounts(
+      doc(46, [
+        { name: "eslint-plugin-browser-security", rules: 40 },
+        { name: "eslint-plugin-jwt", rules: 6 },
+      ]),
+    );
+    assert.equal(out?.totalRules, 46);
+    assert.equal(out?.byPlugin.get("eslint-plugin-browser-security"), 40);
+    assert.equal(out?.byPlugin.size, 2);
+  }
+
+  // The guard that earns its place: the headline disagrees with the sum.
+  {
+    const out = parseRuleCounts(
+      doc(999, [{ name: "eslint-plugin-jwt", rules: 6 }]),
+    );
+    assert.equal(out, null, "a self-contradicting document is unusable");
+  }
+
+  // A row that is not countable would silently shrink the sum, so a document
+  // with any unusable row is rejected rather than partially believed — the
+  // same rule as the page walk above.
+  {
+    const out = parseRuleCounts(
+      doc(6, [{ name: "eslint-plugin-jwt", rules: 6 }, { name: 42 }]),
+    );
+    assert.equal(out, null, "an uncountable row invalidates the document");
+  }
+
+  // Shape failures.
+  for (const bad of [null, {}, { totalRules: 5 }, { plugins: [] }, { totalRules: "5", plugins: [] }]) {
+    assert.equal(parseRuleCounts(bad), null, `rejects ${JSON.stringify(bad)}`);
+  }
+
+  // An empty ecosystem is a legitimate zero, not a failure.
+  assert.deepEqual(parseRuleCounts(doc(0, []))?.totalRules, 0);
+
+  console.log("✓ parseRuleCounts: a headline must agree with its own rows");
 }
