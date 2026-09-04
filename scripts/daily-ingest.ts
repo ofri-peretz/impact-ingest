@@ -12,6 +12,7 @@
 // Runs from .github/workflows/daily-impact-ingest.yml at 05:00 UTC.
 
 import { computeArticleLifts } from "./article-lift.js";
+import { ingestAttention } from "./devto-attention.js";
 import { ingestDevtoWarehouse } from "./devto-warehouse.js";
 import { supabaseAdmin, type Tables } from "./_supabase-admin.js";
 import {
@@ -930,6 +931,9 @@ async function main(): Promise<void> {
     // followers with account age, inbound comments. Non-fatal by design.
     try {
       rowsWritten += await ingestDevtoWarehouse({ today, runId, articles: devtoArticles });
+      // Attention: staff posts, features, staff comments, stars, events. Each
+      // collector fails on its own; none can take the warehouse down with it.
+      rowsWritten += await ingestAttention({ today, runId });
     } catch (e) {
       console.error("[devto-warehouse] skipped:", e instanceof Error ? e.message : e);
     }
