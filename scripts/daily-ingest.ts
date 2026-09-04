@@ -15,6 +15,7 @@ import { computeArticleLifts } from "./article-lift.js";
 import { ingestAttention } from "./devto-attention.js";
 import { ingestDevtoWarehouse } from "./devto-warehouse.js";
 import { supabaseAdmin, type Tables } from "./_supabase-admin.js";
+import { collectPaginated } from "./paginate.js";
 import {
   computeNpmDailyRows,
   trailingIdenticalDays,
@@ -189,28 +190,30 @@ async function fetchGitHubSearchCount(q: string): Promise<number | null> {
   return d.total_count ?? 0;
 }
 
+
 // Cumulative release count across a repo (paginates until exhausted).
 async function fetchGitHubReleaseCount(
   owner: string,
   repo: string,
 ): Promise<number | null> {
-  let total = 0;
-  for (let page = 1; page <= 20; page += 1) {
-    const r = await fetch(
-      `https://api.github.com/repos/${owner}/${repo}/releases?per_page=100&page=${page}`,
-      { headers: await ghHeaders() },
-    );
-    if (!r.ok) {
-      console.error(
-        `[github-releases] ${owner}/${repo} page ${page} → ${r.status}`,
+  const all = await collectPaginated<unknown>(
+    async (page) => {
+      const r = await fetch(
+        `https://api.github.com/repos/${owner}/${repo}/releases?per_page=100&page=${page}`,
+        { headers: await ghHeaders() },
       );
-      return total > 0 ? total : null;
-    }
-    const arr = (await r.json()) as unknown[];
-    total += arr.length;
-    if (arr.length < 100) break;
-  }
-  return total;
+      if (!r.ok) {
+        console.error(
+          `[github-releases] ${owner}/${repo} page ${page} → ${r.status}`,
+        );
+        return null;
+      }
+      const arr = (await r.json()) as unknown[];
+      return Array.isArray(arr) ? arr : null;
+    },
+    { perPage: 100, maxPages: 20 },
+  );
+  return all === null ? null : all.length;
 }
 
 // Outbound reciprocity counter.
@@ -619,33 +622,40 @@ function matchPluginByCodecovName(
 
 // Fetches every article (paginated) so external_articles stays in sync —
 // new posts since the last run land in Supabase automatically.
-async function fetchAllDevtoArticles(): Promise<DevtoArticle[]> {
+async function fetchAllDevtoArticles(): Promise<{
+  articles: DevtoArticle[];
+  complete: boolean;
+}> {
   const apiKey = process.env.DEVTO_API_KEY || process.env.DEV_TO_API_KEY;
   if (!apiKey) {
     console.log("[devto] no API key, skipping");
-    return [];
+    return { articles: [], complete: false };
   }
   // /articles/me/all (not /me) so the view total matches the dev.to dashboard's
   // "Total post views", which counts unpublished drafts too (they retain the
   // views they got while briefly live). Published-only loops below still filter
   // on published_at, so drafts contribute to the totals but not to the article
   // list, count, or per-article snapshots.
-  const all: DevtoArticle[] = [];
-  for (let page = 1; page <= 10; page += 1) {
-    const r = await fetch(
-      `https://dev.to/api/articles/me/all?per_page=100&page=${page}`,
-      { headers: { "api-key": apiKey } },
-    );
-    if (!r.ok) {
-      console.error(`[devto] page ${page} → ${r.status}`);
-      break;
-    }
-    const batch = (await r.json()) as DevtoArticle[];
-    if (batch.length === 0) break;
-    all.push(...batch);
-    if (batch.length < 100) break;
-  }
-  return all;
+  const all = await collectPaginated<DevtoArticle>(
+    async (page) => {
+      const r = await fetch(
+        `https://dev.to/api/articles/me/all?per_page=100&page=${page}`,
+        { headers: { "api-key": apiKey } },
+      );
+      if (!r.ok) {
+        console.error(`[devto] page ${page} → ${r.status}`);
+        return null;
+      }
+      const batch = (await r.json()) as DevtoArticle[];
+      return Array.isArray(batch) ? batch : null;
+    },
+    { perPage: 100, maxPages: 10 },
+  );
+  // Every article we DID read is individually true, so the per-article rows
+  // are worth writing either way. The aggregate is not: summing views over a
+  // truncated list produces a total that looks exactly like a real one and is
+  // silently low. `complete` is what separates the two.
+  return { articles: all ?? [], complete: all !== null };
 }
 
 function summarizeDevto(arts: DevtoArticle[]): {
@@ -683,23 +693,26 @@ async function fetchDevtoFollowers(): Promise<number | null> {
     // silently truncates the count to exactly 1000 once we pass that (the bug
     // that pinned this metric at 1000). Page through until a short page.
     const PER_PAGE = 1000;
-    let total = 0;
-    for (let page = 1; page <= 100; page += 1) {
-      const r = await fetch(
-        `https://dev.to/api/followers/users?per_page=${PER_PAGE}&page=${page}`,
-        { headers: { "api-key": apiKey } },
-      );
-      if (!r.ok) {
-        console.error(`[devto] /followers/users page ${page} → ${r.status}`);
-        return total > 0 ? total : null;
-      }
-      const data = (await r.json()) as unknown[];
-      if (!Array.isArray(data)) return total > 0 ? total : null;
-      total += data.length;
-      if (data.length < PER_PAGE) break;
-      await sleep(300);
-    }
-    return total;
+    const all = await collectPaginated<unknown>(
+      async (page) => {
+        const r = await fetch(
+          `https://dev.to/api/followers/users?per_page=${PER_PAGE}&page=${page}`,
+          { headers: { "api-key": apiKey } },
+        );
+        if (!r.ok) {
+          console.error(`[devto] /followers/users page ${page} → ${r.status}`);
+          return null;
+        }
+        const data = (await r.json()) as unknown[];
+        return Array.isArray(data) ? data : null;
+      },
+      { perPage: PER_PAGE, maxPages: 100, between: () => sleep(300) },
+    );
+    // `null` means we could not finish counting, which is NOT the same as
+    // "zero followers" — and not the same as the partial total this used to
+    // return. A day with no number is a gap; a day with a wrong number is a
+    // lie the chart cannot distinguish from growth.
+    return all === null ? null : all.length;
   }, "devto user followers");
 }
 
@@ -717,18 +730,39 @@ async function startRun(): Promise<string> {
   return data.id;
 }
 
+/**
+ * Close the audit row.
+ *
+ * Three states, not two. A run where nothing threw but a metric came back
+ * UNKNOWN is not a success: on 2026-09-04 the dev.to follower walk failed, the
+ * column went null, and the ledger recorded 17 consecutive green runs with
+ * zero errors. A health signal that cannot see a missing number is not
+ * measuring health.
+ *
+ * `degraded` names the metrics that could not be read. It goes in
+ * `error_message` because that is where a human already looks, and the status
+ * distinguishes "we failed" from "we finished, minus these".
+ */
 async function endRun(
   runId: string,
   rowsWritten: number,
   errorMessage: string | null,
+  degraded: readonly string[] = [],
 ): Promise<void> {
+  const note =
+    errorMessage ??
+    (degraded.length > 0 ? `unknown this run: ${degraded.join(", ")}` : null);
   await supabaseAdmin
     .from("ingest_runs")
     .update({
       finished_at: new Date().toISOString(),
       rows_written: rowsWritten,
-      status: errorMessage ? "error" : "success",
-      error_message: errorMessage,
+      status: errorMessage
+        ? "error"
+        : degraded.length > 0
+          ? "degraded"
+          : "success",
+      error_message: note,
     })
     .eq("id", runId);
 }
@@ -798,6 +832,9 @@ async function main(): Promise<void> {
   const runId = await startRun();
   let rowsWritten = 0;
   let errorMessage: string | null = null;
+  // Metrics that came back UNKNOWN. Not an error — the run finished — but not
+  // a clean success either, and the difference has to reach the audit row.
+  const degraded: string[] = [];
 
   try {
     // Discover first: a package published today is counted today.
@@ -926,7 +963,9 @@ async function main(): Promise<void> {
     const repoStars = await fetchGitHubRepoStars();
     const ghUser = await fetchGitHubUser();
     const ghCommits = await fetchGitHubCommits();
-    const devtoArticles = await fetchAllDevtoArticles();
+    const { articles: devtoArticles, complete: devtoComplete } =
+      await fetchAllDevtoArticles();
+    if (!devtoComplete) degraded.push("devto articles (partial page walk)");
     // dev.to warehouse (own-the-data intent): daily analytics, referrers,
     // followers with account age, inbound comments. Non-fatal by design.
     try {
@@ -938,8 +977,12 @@ async function main(): Promise<void> {
       console.error("[devto-warehouse] skipped:", e instanceof Error ? e.message : e);
     }
     const devtoFollowers = await fetchDevtoFollowers();
+    if (devtoFollowers === null) degraded.push("devto followers");
+    // Totals require a COMPLETE read. A truncated article list sums to a
+    // number that looks real and is silently low, and it lands in a daily
+    // series where nothing downstream can tell it from a genuine dip.
     const devto =
-      devtoArticles.length > 0
+      devtoComplete && devtoArticles.length > 0
         ? {
             ...summarizeDevto(devtoArticles),
             ...(devtoFollowers !== null ? { followers: devtoFollowers } : {}),
@@ -1618,7 +1661,7 @@ async function main(): Promise<void> {
     console.error("[ingest] error:", errorMessage);
   }
 
-  await endRun(runId, rowsWritten, errorMessage);
+  await endRun(runId, rowsWritten, errorMessage, degraded);
   if (errorMessage) process.exit(1);
   console.log(`[ingest] ✓ ${rowsWritten} rows written`);
 }
