@@ -312,3 +312,47 @@ console.log("daily-ingest.check ✓ npm per-day contract holds");
 
   console.log("✓ total_npm_downloads: written by the accumulator, and only there");
 }
+
+// ── 9. The ecosystem daily figure belongs to npm's day, not the run date ─────
+//
+// Structural, and named as wiring rather than behaviour. The behavioural half
+// is already covered by case 1: `computeNpmDailyRows` keys rows by npm's own
+// day. What this pins is that the ECOSYSTEM row stopped stamping that figure
+// on the run date, which is the half that was missed when the same bug was
+// fixed for plugin_daily_metrics in "2026-08-10..19".
+//
+// The residue of that miss is still in the table: 2026-08-11 through 08-16 all
+// read 6,561 — six consecutive dates that never happened.
+{
+  const here = dirname(fileURLToPath(import.meta.url));
+  const ingest = readFileSync(join(here, "daily-ingest.ts"), "utf-8");
+
+  // Positive control: the figure IS written, keyed to npm's day. Without this
+  // the assertion below passes just as well if nobody writes it at all.
+  assert.match(
+    ingest,
+    /observed_on: latestNpmDay, daily_npm_downloads: dailySum/,
+    "the daily figure must be written on npm's own day",
+  );
+
+  // The run-date row must not carry it. Scoped to that upsert so the npm-day
+  // upsert below it stays legal.
+  // Anchored on a field unique to the ecosystem run-date row. The first
+  // version sliced from `observed_on: today,` — which appears in six upserts
+  // in this file, the earliest being article snapshots — so it inspected the
+  // wrong object and would have passed no matter what the ecosystem row
+  // carried. Caught by planting the regression and watching nothing fail.
+  const anchor = "total_packages: plugins?.length";
+  assert.equal(
+    ingest.split(anchor).length - 1,
+    1,
+    "the anchor must identify exactly one upsert",
+  );
+  const runDateUpsert = ingest.slice(ingest.indexOf(anchor)).slice(0, 500);
+  assert.ok(
+    !runDateUpsert.includes("daily_npm_downloads"),
+    "the run-date row must NOT carry npm's daily figure",
+  );
+
+  console.log("✓ daily_npm_downloads: keyed to npm's day, not the run date");
+}
