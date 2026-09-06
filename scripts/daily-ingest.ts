@@ -1436,6 +1436,19 @@ async function main(): Promise<void> {
     );
     if (alltimeTotal === 0) degraded.push("npm all-time total");
 
+    // `daily_npm_downloads` is NOT written on this row, and that is the fix.
+    //
+    // This row is keyed by the RUN date and carries run-date facts: package
+    // count, rule count, coverage. The npm daily figure is not a run-date fact
+    // — it is `last.d1`, npm's most recently COLLECTED day — so stamping it
+    // here recorded the same number under a new date every time npm's stats
+    // pipeline lagged.
+    //
+    // That is not hypothetical and it is not new: it is the incident this
+    // file's own check header describes, "2026-08-10..19", fixed then for
+    // plugin_daily_metrics and missed here. The residue is still in the table
+    // — 2026-08-11 through 08-16 all read 6,561, six consecutive dates that
+    // never happened. It is written below, keyed to npm's own day.
     const { error: eErr } = await supabaseAdmin
       .from("ecosystem_daily_metrics")
       .upsert(
@@ -1444,7 +1457,6 @@ async function main(): Promise<void> {
           total_packages: plugins?.length ?? null,
           total_plugins: plugins?.length ?? null,
           ...(ruleCounts ? { total_rules: ruleCounts.totalRules } : {}),
-          daily_npm_downloads: dailySum,
           test_coverage: repoTotals?.coverage ?? null,
           total_lines: repoTotals?.lines ?? null,
           covered_lines: repoTotals?.hits ?? null,
@@ -1456,6 +1468,28 @@ async function main(): Promise<void> {
       );
     if (eErr) throw new Error(`ecosystem upsert: ${eErr.message}`);
     rowsWritten += 1;
+
+    // The npm daily figure, on npm's day. A separate upsert because the two
+    // facts have different dates whenever npm lags, and merge-duplicates
+    // means this touches only this column — the run-date row above keeps
+    // everything it just wrote, and a day npm has not reported simply has no
+    // number rather than a repeat of the last one it did.
+    if (latestNpmDay !== null) {
+      const { error: dErr } = await supabaseAdmin
+        .from("ecosystem_daily_metrics")
+        .upsert(
+          { observed_on: latestNpmDay, daily_npm_downloads: dailySum },
+          { onConflict: "observed_on" },
+        );
+      if (dErr) throw new Error(`ecosystem daily upsert: ${dErr.message}`);
+      if (latestNpmDay !== today) {
+        console.log(
+          `[npm] daily total ${dailySum} recorded on npm's day ${latestNpmDay}, not the run date ${today}`,
+        );
+      }
+    } else {
+      degraded.push("npm daily total (no collected day)");
+    }
 
     // Download-to-star ratio, over the TRUE all-time total.
     // It was computed from the running sum, so the headline metric in
