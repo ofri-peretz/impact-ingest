@@ -10,7 +10,7 @@
     "lift": "tsx scripts/article-lift.ts",
     "attention": "tsx scripts/devto-attention.ts",
     "catalog:dry": "tsx scripts/plugin-catalog.ts",
-    "check": "tsx scripts/daily-ingest.check.ts && SUPABASE_URL=https://check.invalid SUPABASE_SERVICE_ROLE_KEY=check tsx scripts/article-lift.check.ts && SUPABASE_URL=https://check.invalid SUPABASE_SERVICE_ROLE_KEY=check tsx scripts/devto-warehouse.check.ts && SUPABASE_URL=https://check.invalid SUPABASE_SERVICE_ROLE_KEY=check tsx scripts/devto-attention.check.ts",
+    "check": "tsx scripts/plugin-catalog.check.ts && tsx scripts/daily-ingest.check.ts && SUPABASE_URL=https://check.invalid SUPABASE_SERVICE_ROLE_KEY=check tsx scripts/article-lift.check.ts && SUPABASE_URL=https://check.invalid SUPABASE_SERVICE_ROLE_KEY=check tsx scripts/devto-warehouse.check.ts && SUPABASE_URL=https://check.invalid SUPABASE_SERVICE_ROLE_KEY=check tsx scripts/devto-attention.check.ts",
     "devto:backfill": "tsx scripts/devto-warehouse.ts --since 2026-02-23 --followers-all",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },

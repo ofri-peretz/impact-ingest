@@ -24,6 +24,7 @@ import {
 import {
   trackedPackages,
   fetchCatalog,
+  isPluginPackage,
   IGNORED_PACKAGES,
 } from "./plugin-catalog.js";
 
@@ -1454,8 +1455,13 @@ async function main(): Promise<void> {
       .upsert(
         {
           observed_on: today,
+          // These were both plugins.length until 2026-09-07, which was fine
+          // only while every package we published was a plugin. `burgee` (an
+          // agent-native CLI framework) broke that: its downloads are ours and
+          // belong in the totals, but counting it as a plugin would claim a
+          // plugin that does not exist. See NON_PLUGIN_PACKAGES.
           total_packages: plugins?.length ?? null,
-          total_plugins: plugins?.length ?? null,
+          total_plugins: plugins?.filter((p) => isPluginPackage(p.name)).length ?? null,
           ...(ruleCounts ? { total_rules: ruleCounts.totalRules } : {}),
           test_coverage: repoTotals?.coverage ?? null,
           total_lines: repoTotals?.lines ?? null,

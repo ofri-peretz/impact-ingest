@@ -96,13 +96,48 @@ const NPM_USER_AGENT =
 export const DEPRECATED_INCLUDE = ["eslint-plugin-jwt", "eslint-plugin-pg"];
 
 /**
+ * First-party packages that are ours and counted, but are NOT ESLint plugins,
+ * mapped to the category they belong in.
+ *
+ * These belong in download totals and `total_packages`; they must stay out of
+ * `total_plugins`, or the ecosystem publicly claims a plugin it does not have
+ * — the same shape of defect as the seeded `plugins` table that reported 25
+ * names while 30 existed, only pointing the other way.
+ *
+ * Extends Ofri's 2026-06-22 scope decision on 2026-09-07: the North Star
+ * counts everything we ship, while "plugin" counts stay literally plugins.
+ */
+export const NON_PLUGIN_PACKAGES: Readonly<Record<string, string>> = {
+  burgee: "cli", // agent-native CLI framework; first published 2026-09-07
+};
+
+/**
+ * Is this an ESLint plugin, as opposed to another package we publish?
+ *
+ * Split from isInterlacePackage deliberately: membership in the ecosystem and
+ * being a plugin used to be the same question, which is why `total_packages`
+ * and `total_plugins` were both `plugins.length`. They are now different
+ * questions with different answers.
+ */
+export function isPluginPackage(name: string): boolean {
+  return !(name in NON_PLUGIN_PACKAGES);
+}
+
+/**
  * Ofri's 2026-06-22 decision (migration 20260622010000): the North Star counts
  * the Interlace ESLint ecosystem, not every side project. `@forge-js/*` ships
  * from the same npm account and comes back from the same search, so ownership
  * has to be an explicit predicate rather than "whatever the search returned".
+ *
+ * NON_PLUGIN_PACKAGES joins on the same terms: named one by one, never by a
+ * pattern that could sweep a side project in.
  */
 export function isInterlacePackage(name: string): boolean {
-  return name.startsWith("@interlace/") || name.startsWith("eslint-plugin-");
+  return (
+    name.startsWith("@interlace/") ||
+    name.startsWith("eslint-plugin-") ||
+    name in NON_PLUGIN_PACKAGES
+  );
 }
 
 /**
@@ -111,6 +146,8 @@ export function isInterlacePackage(name: string): boolean {
  * framework name is framework — that is how the seeded rows were bucketed.
  */
 export function deriveCategory(name: string): string {
+  const nonPlugin = NON_PLUGIN_PACKAGES[name];
+  if (nonPlugin) return nonPlugin; // else `burgee` falls through to "quality"
   if (name.includes("react")) return "react";
   if (/express|nestjs|lambda|serverless/.test(name)) return "framework";
   if (/import-next|devkit|architecture/.test(name)) return "architecture";
