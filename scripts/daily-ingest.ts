@@ -790,19 +790,23 @@ async function endRun(
   const note =
     errorMessage ??
     (degraded.length > 0 ? `unknown this run: ${degraded.join(", ")}` : null);
-  await supabaseAdmin
+  // The persisted value is "partial", not "degraded": ingest_runs_status_check
+  // admits success/partial/error/running, and "partial" has meant exactly this
+  // state since the table was created. Writing "degraded" tripped the CHECK, and
+  // because the result went unread the whole terminal update was discarded —
+  // every run with a missing metric stranded its audit row at "running".
+  const { error } = await supabaseAdmin
     .from("ingest_runs")
     .update({
       finished_at: new Date().toISOString(),
       rows_written: rowsWritten,
-      status: errorMessage
-        ? "error"
-        : degraded.length > 0
-          ? "degraded"
-          : "success",
+      status: errorMessage ? "error" : degraded.length > 0 ? "partial" : "success",
       error_message: note,
     })
     .eq("id", runId);
+  // Never swallow this. The audit row is the only evidence the run happened;
+  // if we cannot close it, the ledger is lying and the operator must hear so.
+  if (error) throw new Error(`ingest_runs close (${runId}): ${error.message}`);
 }
 
 // ─── Plugin catalog, write side ──────────────────────────────────────────
@@ -876,7 +880,21 @@ async function main(): Promise<void> {
 
   try {
     // Discover first: a package published today is counted today.
-    await syncPluginCatalog();
+    //
+    // Non-fatal, for the same reason the null-catalog return inside it is:
+    // discovery decides which package *cards* exist, and yesterday's answer is
+    // still right for every package already published. Letting it throw gave a
+    // card-adding step the power to abort metric collection — on 2026-09-08
+    // `burgee` arrived with category 'cli' that plugins_category_check did not
+    // admit, and five consecutive nightly runs wrote rows_written: 0 because of
+    // it. A discovery failure should cost one package a day of visibility; it
+    // must never cost every package its metrics.
+    try {
+      await syncPluginCatalog();
+    } catch (e) {
+      console.warn(`[catalog] sync failed (non-fatal): ${String(e)}`);
+      degraded.push("plugin catalog");
+    }
 
     const { data: allPluginRows, error: pluginsErr } = await supabaseAdmin
       .from("plugins")
