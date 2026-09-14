@@ -23,6 +23,9 @@
  * Pure functions only — no network, no database, no secrets.
  */
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   isInterlacePackage,
   isPluginPackage,
@@ -71,3 +74,64 @@ assert.equal(
 );
 
 console.log("✓ plugin-catalog: ecosystem/plugin split holds");
+
+// 6. Every category deriveCategory can emit must satisfy plugins_category_check
+//
+// Case 4 above already pins deriveCategory("burgee") === "cli". It passed, and
+// the nightly ingest still died: the assertion proved the code did what its
+// author meant, and never asked whether the database would accept it.
+// impact-ingest#11 shipped 'cli' into a CHECK that knew five categories, so the
+// catalog insert was rejected and the whole run wrote zero rows.
+//
+// This is the same defect as ingest_runs.status = 'degraded' one day earlier.
+// A new enum value in application code is a schema change; this case is what
+// makes the schema say so before the cron does.
+{
+  // Mirrors plugins_category_check (migration 20260908000000_plugins_category_cli).
+  // Changing one without the other is the bug this case exists to catch.
+  const ALLOWED = new Set([
+    "security",
+    "quality",
+    "framework",
+    "react",
+    "architecture",
+    "cli",
+  ]);
+
+  // a. Every hand-mapped non-plugin category.
+  for (const [pkg, category] of Object.entries(NON_PLUGIN_PACKAGES))
+    assert.ok(
+      ALLOWED.has(category),
+      `NON_PLUGIN_PACKAGES["${pkg}"] = "${category}", which plugins_category_check rejects`,
+    );
+
+  // b. Every literal deriveCategory can return, read from the source so a new
+  //    branch cannot be added without either passing here or failing loudly.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const catalog = readFileSync(join(here, "plugin-catalog.ts"), "utf-8");
+  const anchor = "export function deriveCategory(";
+  assert.equal(
+    catalog.split(anchor).length - 1,
+    1,
+    "the anchor must identify exactly one deriveCategory",
+  );
+  const fn = catalog.slice(catalog.indexOf(anchor));
+  const returns = [
+    ...fn.slice(0, fn.indexOf("\n}")).matchAll(/return "([a-z_]+)"/g),
+  ].map((m) => m[1]!);
+
+  // Positive control: the literals are really being read. Without it, an
+  // anchor that silently matched an empty body would pass this case entirely.
+  assert.ok(
+    returns.length >= 4,
+    `expected deriveCategory's return literals, found ${returns.length}`,
+  );
+
+  for (const category of returns)
+    assert.ok(
+      ALLOWED.has(category),
+      `deriveCategory can return "${category}", which plugins_category_check rejects`,
+    );
+
+  console.log("✓ plugin-catalog: every category satisfies plugins_category_check");
+}

@@ -39,7 +39,10 @@ const GHA_RUN_URL =
     ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
     : null;
 
-type PluginRow = Pick<Tables["plugins"]["Row"], "id" | "name" | "slug">;
+type PluginRow = Pick<
+  Tables["plugins"]["Row"],
+  "id" | "name" | "slug" | "deprecated"
+>;
 type Period = "last-week" | "last-month" | "last-day";
 
 interface NpmDownloadsPoint {
@@ -790,19 +793,23 @@ async function endRun(
   const note =
     errorMessage ??
     (degraded.length > 0 ? `unknown this run: ${degraded.join(", ")}` : null);
-  await supabaseAdmin
+  // The persisted value is "partial", not "degraded": ingest_runs_status_check
+  // admits success/partial/error/running, and "partial" has meant exactly this
+  // state since the table was created. Writing "degraded" tripped the CHECK, and
+  // because the result went unread the whole terminal update was discarded —
+  // every run with a missing metric stranded its audit row at "running".
+  const { error } = await supabaseAdmin
     .from("ingest_runs")
     .update({
       finished_at: new Date().toISOString(),
       rows_written: rowsWritten,
-      status: errorMessage
-        ? "error"
-        : degraded.length > 0
-          ? "degraded"
-          : "success",
+      status: errorMessage ? "error" : degraded.length > 0 ? "partial" : "success",
       error_message: note,
     })
     .eq("id", runId);
+  // Never swallow this. The audit row is the only evidence the run happened;
+  // if we cannot close it, the ledger is lying and the operator must hear so.
+  if (error) throw new Error(`ingest_runs close (${runId}): ${error.message}`);
 }
 
 // ─── Plugin catalog, write side ──────────────────────────────────────────
@@ -876,11 +883,25 @@ async function main(): Promise<void> {
 
   try {
     // Discover first: a package published today is counted today.
-    await syncPluginCatalog();
+    //
+    // Non-fatal, for the same reason the null-catalog return inside it is:
+    // discovery decides which package *cards* exist, and yesterday's answer is
+    // still right for every package already published. Letting it throw gave a
+    // card-adding step the power to abort metric collection — on 2026-09-08
+    // `burgee` arrived with category 'cli' that plugins_category_check did not
+    // admit, and five consecutive nightly runs wrote rows_written: 0 because of
+    // it. A discovery failure should cost one package a day of visibility; it
+    // must never cost every package its metrics.
+    try {
+      await syncPluginCatalog();
+    } catch (e) {
+      console.warn(`[catalog] sync failed (non-fatal): ${String(e)}`);
+      degraded.push("plugin catalog");
+    }
 
     const { data: allPluginRows, error: pluginsErr } = await supabaseAdmin
       .from("plugins")
-      .select("id,name,slug");
+      .select("id,name,slug,deprecated");
     if (pluginsErr) throw new Error(`plugins select: ${pluginsErr.message}`);
 
     // Deny-list, not allow-list. This table was hand-seeded in two migrations
@@ -1387,8 +1408,14 @@ async function main(): Promise<void> {
         // metric so the dashboard can show a warning, and log at error level so
         // the ingest stdout is searchable.
         const matchedPluginIds = new Set(coverageRows.map((r) => r.plugin_id));
+        // Deprecated entries are renames kept only so their download history
+        // survives (eslint-plugin-pg → -postgresql-security, -jwt →
+        // -jwt-security). They have no source tree of their own, so "no
+        // coverage row" is the correct state and not a gap. Warning on them
+        // taught the eye to skip a warning that also names the real gaps —
+        // which is how three uncovered serverless packages sat unread.
         const unmatched = (plugins as PluginRow[]).filter(
-          (p) => !matchedPluginIds.has(p.id),
+          (p) => !matchedPluginIds.has(p.id) && !p.deprecated,
         );
         if (unmatched.length > 0) {
           const names = unmatched.map((p) => p.name).join(", ");

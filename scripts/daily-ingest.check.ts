@@ -356,3 +356,148 @@ console.log("daily-ingest.check ✓ npm per-day contract holds");
 
   console.log("✓ daily_npm_downloads: keyed to npm's day, not the run date");
 }
+
+// ── 10. Every status endRun can persist must satisfy the DB CHECK ────────────
+//
+// On 2026-09-04 commit 1b99c1b taught endRun a third terminal state and wrote
+// it as "degraded". `ingest_runs_status_check` admits success/partial/error/
+// running, so Postgres rejected the row — and because endRun discarded the
+// PostgrestError, the whole terminal update vanished. The run logged
+// "✓ 1469 rows written" while its audit row sat at 'running' forever, which is
+// precisely the shape the monitor reads to decide a day was missed.
+//
+// Structural, because the failure lives in the gap between two files: no unit
+// test of endRun can see a constraint that is declared in the database.
+{
+  const here = dirname(fileURLToPath(import.meta.url));
+  const ingest = readFileSync(join(here, "daily-ingest.ts"), "utf-8");
+
+  // Mirrors ingest_runs_status_check. Widening the constraint means widening
+  // this line — deliberately, in a commit, rather than discovering it in prod.
+  const ALLOWED = new Set(["success", "partial", "error", "running"]);
+
+  const anchor = "async function endRun(";
+  assert.equal(
+    ingest.split(anchor).length - 1,
+    1,
+    "the anchor must identify exactly one endRun",
+  );
+  const body = ingest.slice(ingest.indexOf(anchor));
+  const statusExpr = body.slice(
+    body.indexOf("status:"),
+    body.indexOf("error_message:"),
+  );
+  const emitted = [...statusExpr.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]!);
+
+  // Positive control: all three terminal states are really in that expression.
+  // Without it, a refactor that stopped writing `status` at all would pass.
+  assert.deepEqual(
+    [...new Set(emitted)].sort(),
+    ["error", "partial", "success"],
+    "endRun must still emit all three terminal states",
+  );
+
+  for (const status of emitted)
+    assert.ok(
+      ALLOWED.has(status),
+      `endRun writes status="${status}", which ingest_runs_status_check rejects`,
+    );
+
+  // The opening state is written by startRun and is under the same constraint.
+  const open = ingest.slice(ingest.indexOf("async function startRun("));
+  const opened = /status: "([a-z_]+)"/.exec(open)?.[1];
+  assert.ok(
+    opened && ALLOWED.has(opened),
+    `startRun writes status="${opened}", which ingest_runs_status_check rejects`,
+  );
+
+  // A rejected close must be raised, never swallowed: the audit row is the
+  // only evidence the run happened.
+  // Anchored to line start so a commented-out throw does not satisfy it. The
+  // first version matched `// if (error) throw ...` and passed on the very
+  // regression it exists to catch.
+  assert.match(
+    body.slice(0, body.indexOf("\n}")),
+    /^\s*if \(error\) throw new Error/m,
+    "endRun must throw when the terminal update is rejected",
+  );
+
+  console.log("✓ ingest_runs status: every emitted value satisfies the CHECK");
+}
+
+// ── 11. Discovery must not be able to abort metric collection ────────────────
+//
+// syncPluginCatalog() is the first await in main(). It only decides which
+// package *cards* exist — it collects no metric — yet for five consecutive
+// nights (2026-09-08..12) it took the entire run down: `burgee` was published
+// with category 'cli', plugins_category_check admitted only five categories,
+// the insert was rejected, and the throw propagated out of main() before a
+// single metric was read. Every one of those runs wrote rows_written: 0 and
+// ecosystem_daily_metrics has no row at all for 2026-09-10..12.
+//
+// Case 6 of plugin-catalog.check.ts stops *that* category mismatch. This case
+// stops the class: whatever the next discovery failure turns out to be — an
+// npm outage, a new column, a fresh CHECK — it must degrade the run, not end
+// it. The blast radius is the bug, not the trigger.
+//
+// Structural, because the failure is a missing try/catch: no unit test of
+// syncPluginCatalog can observe what its *caller* does with a throw.
+{
+  const here = dirname(fileURLToPath(import.meta.url));
+  const ingest = readFileSync(join(here, "daily-ingest.ts"), "utf-8");
+
+  const anchor = "async function main(";
+  assert.equal(
+    ingest.split(anchor).length - 1,
+    1,
+    "the anchor must identify exactly one main",
+  );
+  const body = ingest.slice(ingest.indexOf(anchor));
+
+  // Positive control: the call is really in main() and really being read.
+  // Without it, a rename would make every assertion below vacuously true.
+  assert.match(
+    body,
+    /await syncPluginCatalog\(\)/,
+    "main must still call syncPluginCatalog",
+  );
+
+  // The call sits inside a try whose catch degrades rather than rethrows.
+  // Anchored tightly: a bare `try {` anywhere earlier in main must not count.
+  const opensCatch =
+    /try \{\s*await syncPluginCatalog\(\);\s*\} catch \([a-z]+\) \{/.exec(body);
+  assert.ok(
+    opensCatch,
+    "syncPluginCatalog() must be wrapped in its own try/catch — an unguarded " +
+      "throw aborts main() before any metric is collected",
+  );
+
+  // Brace-match the catch body rather than lazy-matching to the first `}`.
+  // The first version did the latter and stopped inside `${String(e)}`, so it
+  // failed against the very fix it exists to hold — a template literal in the
+  // catch was enough to defeat it.
+  const from = opensCatch.index + opensCatch[0].length;
+  let depth = 1;
+  let i = from;
+  for (; i < body.length && depth > 0; i++) {
+    if (body[i] === "{") depth++;
+    else if (body[i] === "}") depth--;
+  }
+  assert.equal(depth, 0, "the catch block must be brace-balanced");
+  const caught = body.slice(from, i - 1);
+
+  // Degrading means the audit row says so. A silent swallow is worse than the
+  // throw: the run would report a clean success while the catalog went stale.
+  assert.match(
+    caught,
+    /degraded\.push\(/,
+    "the catch must degrade the run (degraded.push), not swallow the failure",
+  );
+  assert.doesNotMatch(
+    caught,
+    /\bthrow\b/,
+    "the catch must not rethrow — that restores the total-outage behaviour",
+  );
+
+  console.log("✓ catalog discovery degrades the run, it cannot abort it");
+}
