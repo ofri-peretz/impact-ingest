@@ -39,7 +39,10 @@ const GHA_RUN_URL =
     ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
     : null;
 
-type PluginRow = Pick<Tables["plugins"]["Row"], "id" | "name" | "slug">;
+type PluginRow = Pick<
+  Tables["plugins"]["Row"],
+  "id" | "name" | "slug" | "deprecated"
+>;
 type Period = "last-week" | "last-month" | "last-day";
 
 interface NpmDownloadsPoint {
@@ -898,7 +901,7 @@ async function main(): Promise<void> {
 
     const { data: allPluginRows, error: pluginsErr } = await supabaseAdmin
       .from("plugins")
-      .select("id,name,slug");
+      .select("id,name,slug,deprecated");
     if (pluginsErr) throw new Error(`plugins select: ${pluginsErr.message}`);
 
     // Deny-list, not allow-list. This table was hand-seeded in two migrations
@@ -1405,8 +1408,14 @@ async function main(): Promise<void> {
         // metric so the dashboard can show a warning, and log at error level so
         // the ingest stdout is searchable.
         const matchedPluginIds = new Set(coverageRows.map((r) => r.plugin_id));
+        // Deprecated entries are renames kept only so their download history
+        // survives (eslint-plugin-pg → -postgresql-security, -jwt →
+        // -jwt-security). They have no source tree of their own, so "no
+        // coverage row" is the correct state and not a gap. Warning on them
+        // taught the eye to skip a warning that also names the real gaps —
+        // which is how three uncovered serverless packages sat unread.
         const unmatched = (plugins as PluginRow[]).filter(
-          (p) => !matchedPluginIds.has(p.id),
+          (p) => !matchedPluginIds.has(p.id) && !p.deprecated,
         );
         if (unmatched.length > 0) {
           const names = unmatched.map((p) => p.name).join(", ");
