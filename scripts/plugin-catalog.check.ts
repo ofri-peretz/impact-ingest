@@ -32,6 +32,11 @@ import {
   deriveCategory,
   NON_PLUGIN_PACKAGES,
 } from "./plugin-catalog.js";
+import {
+  STARRED_REPOS,
+  REPO_STARS_SOURCE,
+  REPO_STARS_KIND,
+} from "./tracked-repos.js";
 
 // 1. In the ecosystem — this is what puts its downloads in the totals.
 assert.equal(isInterlacePackage("burgee"), true, "burgee must be counted");
@@ -58,16 +63,18 @@ for (const side of ["@forge-js/core", "some-random-package"]) {
 
 // 5. The totals diverge by exactly the non-plugin count — this is the number
 //    that reaches the control room's "Plugins" tile and the blog.
+//    Every non-plugin is in the counted set, so the difference is the map's
+//    size — the map growing (burgee's siblings, 2026-09-22) must not break it.
 const counted = [
   "eslint-plugin-anthropic",
   "eslint-plugin-react-a11y",
   "@interlace/devkit",
-  "burgee",
+  ...Object.keys(NON_PLUGIN_PACKAGES),
 ];
 const totalPackages = counted.length;
 const totalPlugins = counted.filter(isPluginPackage).length;
-assert.equal(totalPackages, 4);
-assert.equal(totalPlugins, 3, "burgee must not inflate the plugin count");
+assert.equal(totalPackages, 3 + Object.keys(NON_PLUGIN_PACKAGES).length);
+assert.equal(totalPlugins, 3, "non-plugins must not inflate the plugin count");
 assert.equal(
   totalPackages - totalPlugins,
   Object.keys(NON_PLUGIN_PACKAGES).length,
@@ -134,4 +141,51 @@ console.log("✓ plugin-catalog: ecosystem/plugin split holds");
     );
 
   console.log("✓ plugin-catalog: every category satisfies plugins_category_check");
+}
+
+// 7. The whole burgee family is counted, as cli packages, not plugins.
+//
+// burgee alone was admitted on 2026-09-07; the eight packages it composes
+// shipped from the same repo over the next week and were silently absent —
+// isInterlacePackage names non-plugins one at a time, so nothing errors when a
+// sibling is missing. This case is the list the repo actually publishes.
+{
+  const BURGEE_FAMILY = [
+    "burgee",
+    "roundel",
+    "flagstaff",
+    "caique",
+    "linegauge",
+    "seniority",
+    "bellpull",
+    "closeout",
+    "paratext",
+  ];
+  for (const name of BURGEE_FAMILY) {
+    assert.equal(isInterlacePackage(name), true, `${name} must be counted`);
+    assert.equal(isPluginPackage(name), false, `${name} is not a plugin`);
+    assert.equal(deriveCategory(name), "cli", `${name} is a cli package`);
+  }
+  // Earlier names for roundel/caique from the same repo: not counted, or one
+  // product is listed twice. Positive control is the loop above.
+  for (const name of ["pennon", "answering", "answerback"]) {
+    assert.equal(isInterlacePackage(name), false, `${name} leaked in`);
+  }
+  console.log("✓ plugin-catalog: burgee family counted as cli, not plugins");
+}
+
+// 8. Per-repo stars stay out of the eng_github_stars ratchet's fallback read.
+//
+// refresh_storefront_ratchet falls back to metric_snapshots
+// WHERE source = 'github-repo' AND kind = 'stars' — no dimension filter.
+// A per-repo row under that source would let any one repo's count stand in
+// for the ecosystem's.
+{
+  assert.notEqual(REPO_STARS_SOURCE, "github-repo");
+  assert.equal(REPO_STARS_KIND, "stars");
+  assert.ok(STARRED_REPOS.includes("ofri-peretz/burgee"));
+  for (const repo of STARRED_REPOS)
+    assert.match(repo, /^[\w.-]+\/[\w.-]+$/, `${repo} is not owner/repo`);
+  assert.equal(new Set(STARRED_REPOS).size, STARRED_REPOS.length);
+  console.log("✓ tracked-repos: per-repo stars are isolated from the ratchet");
 }
