@@ -109,6 +109,22 @@ export const DEPRECATED_INCLUDE = ["eslint-plugin-jwt", "eslint-plugin-pg"];
  */
 export const NON_PLUGIN_PACKAGES: Readonly<Record<string, string>> = {
   burgee: "cli", // agent-native CLI framework; first published 2026-09-07
+
+  // The rest of the burgee family (github.com/ofri-peretz/burgee), each a
+  // standalone zero-dependency package burgee composes. Named one by one for
+  // the reason above; all "cli" because that is the product line they ship in.
+  roundel: "cli", // colours + output policy; first published 2026-09-08
+  flagstaff: "cli", // terminal frame loop + widgets; 2026-09-08
+  caique: "cli", // flags-first prompts; 2026-09-08
+  linegauge: "cli", // grapheme-correct width/wrap/truncate; 2026-09-09
+  seniority: "cli", // config resolution with provenance; 2026-09-09
+  bellpull: "cli", // subprocesses with a structured result; 2026-09-09
+  closeout: "cli", // exit handlers + terminal restore; 2026-09-09
+  paratext: "cli", // OSC: hyperlinks, images, title, clipboard; 2026-09-13
+  // NOT here, on purpose: `pennon`, `answering`, `answerback`. Same repo, but
+  // they are earlier names for roundel/caique (same descriptions), published
+  // on 2026-09-08 minutes before the final names. Counting them would list one
+  // product twice; isInterlacePackage keeps them out because they are absent.
 };
 
 /**
@@ -253,6 +269,12 @@ if (process.argv[1]?.endsWith("plugin-catalog.ts")) {
   }
   for (const name of IGNORED_PACKAGES) {
     if (names.has(name)) throw new Error(`ignore list breached by ${name}`);
+  }
+  // A misspelled NON_PLUGIN_PACKAGES key admits nothing and errors nowhere —
+  // the package just never gets counted. Discovery is the only thing that can
+  // tell a typo from a real name.
+  for (const name of Object.keys(NON_PLUGIN_PACKAGES)) {
+    if (!names.has(name)) throw new Error(`non-plugin ${name} not discovered`);
   }
   if (catalog.length < 20) {
     throw new Error(`only ${catalog.length} packages — search likely degraded`);

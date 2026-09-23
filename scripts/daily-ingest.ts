@@ -27,6 +27,11 @@ import {
   isPluginPackage,
   IGNORED_PACKAGES,
 } from "./plugin-catalog.js";
+import {
+  STARRED_REPOS,
+  REPO_STARS_SOURCE,
+  REPO_STARS_KIND,
+} from "./tracked-repos.js";
 
 const GITHUB_REPO_OWNER = "ofri-peretz";
 const GITHUB_REPO_NAME = "eslint";
@@ -241,13 +246,14 @@ async function fetchDevtoCommentsLeft(): Promise<number | null> {
   return n;
 }
 
-async function fetchGitHubRepoStars(): Promise<number | null> {
-  const r = await fetch(
-    `https://api.github.com/repos/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}`,
-    { headers: await ghHeaders() },
-  );
+async function fetchGitHubRepoStars(
+  fullName = `${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}`,
+): Promise<number | null> {
+  const r = await fetch(`https://api.github.com/repos/${fullName}`, {
+    headers: await ghHeaders(),
+  });
   if (!r.ok) {
-    console.error(`[github-repo] → ${r.status}`);
+    console.error(`[github-repo] ${fullName} → ${r.status}`);
     return null;
   }
   const data = (await r.json()) as { stargazers_count: number };
@@ -1241,6 +1247,28 @@ async function main(): Promise<void> {
         ingest_run_id: runId,
       });
       console.log(`[github] releases_cumulative=${releases}`);
+    }
+
+    // Per-repo stars → metric_snapshots, one row per repo (see tracked-repos.ts
+    // for why this is not the github-repo creator row).
+    for (const repo of STARRED_REPOS) {
+      const stars =
+        repo === `${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}`
+          ? repoStars
+          : await fetchGitHubRepoStars(repo);
+      if (stars === null) {
+        degraded.push(`github stars ${repo}`);
+        continue;
+      }
+      reciprocityRows.push({
+        source: REPO_STARS_SOURCE,
+        kind: REPO_STARS_KIND,
+        dimension: repo,
+        observed_on: today,
+        value: stars,
+        ingest_run_id: runId,
+      });
+      console.log(`[github] stars ${repo}=${stars}`);
     }
 
     const pageviews = await fetchPostHogPageviews();
