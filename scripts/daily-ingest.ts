@@ -1049,6 +1049,10 @@ async function main(): Promise<void> {
     const { articles: devtoArticles, complete: devtoComplete } =
       await fetchAllDevtoArticles();
     if (!devtoComplete) degraded.push("devto articles (partial page walk)");
+    // Before the warehouse: its join-date fill walks /users/:id until dev.to
+    // answers 429, and a follower read after it lands in that cool-down.
+    const devtoFollowers = await fetchDevtoFollowers();
+    if (devtoFollowers === null) degraded.push("devto followers");
     // dev.to warehouse (own-the-data intent): daily analytics, referrers,
     // followers with account age, inbound comments. Non-fatal by design.
     try {
@@ -1059,8 +1063,6 @@ async function main(): Promise<void> {
     } catch (e) {
       console.error("[devto-warehouse] skipped:", e instanceof Error ? e.message : e);
     }
-    const devtoFollowers = await fetchDevtoFollowers();
-    if (devtoFollowers === null) degraded.push("devto followers");
     // Totals require a COMPLETE read. A truncated article list sums to a
     // number that looks real and is silently low, and it lands in a daily
     // series where nothing downstream can tell it from a genuine dip.
