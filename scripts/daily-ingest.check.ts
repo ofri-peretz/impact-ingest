@@ -501,3 +501,21 @@ console.log("daily-ingest.check ✓ npm per-day contract holds");
 
   console.log("✓ catalog discovery degrades the run, it cannot abort it");
 }
+
+// 6. The follower count is read before the dev.to warehouse runs. The
+//    warehouse's join-date fill walks /users/:id until dev.to answers 429, and
+//    a /followers/users call made after it lands inside that cool-down — 6 of
+//    7 runs to 2026-09-27 went `partial` with "unknown this run: devto
+//    followers" for exactly this reason.
+{
+  const here = dirname(fileURLToPath(import.meta.url));
+  const ingest = readFileSync(join(here, "daily-ingest.ts"), "utf-8");
+  const followers = ingest.indexOf("await fetchDevtoFollowers()");
+  const warehouse = ingest.indexOf("await ingestDevtoWarehouse(");
+  assert.ok(followers > 0 && warehouse > 0, "both calls must exist");
+  assert.ok(
+    followers < warehouse,
+    "fetchDevtoFollowers must run before ingestDevtoWarehouse spends the dev.to rate limit",
+  );
+  console.log("✓ devto follower count is read before the warehouse spends the rate limit");
+}
