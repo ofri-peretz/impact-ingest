@@ -49,10 +49,20 @@ const isoDay = (t: number): string => new Date(t).toISOString().slice(0, 10);
 export function computeNpmDailyRows(
   days: NpmRangeDay[],
   backfillDays: number,
+  collectedThrough?: string | null,
 ): NpmDailyRow[] {
   const sorted = [...days].sort((a, b) => a.day.localeCompare(b.day));
   let end = sorted.length;
-  while (end > 0 && sorted[end - 1]!.downloads === 0) end -= 1;
+  if (collectedThrough === undefined) {
+    while (end > 0 && sorted[end - 1]!.downloads === 0) end -= 1;
+  } else {
+    while (
+      end > 0 &&
+      (collectedThrough === null || sorted[end - 1]!.day > collectedThrough)
+    ) {
+      end -= 1;
+    }
+  }
   const collected = sorted.slice(0, end);
 
   const byDay = new Map(collected.map((d) => [d.day, d.downloads]));
@@ -69,6 +79,25 @@ export function computeNpmDailyRows(
     d7: win(day, 7),
     d30: win(day, 30),
   }));
+}
+
+/**
+ * The last day npm has collected, judged across every package: npm collects
+ * a day for all packages at once, so a day ANY package has downloads on is a
+ * collected day for all of them. Passed to computeNpmDailyRows, it keeps a
+ * quiet package's real zero days instead of dropping them as "maybe not
+ * collected" — the per-package trim left 43–47 rows a day where 48 exist.
+ */
+export function latestCollectedDay(
+  series: Iterable<NpmRangeDay[]>,
+): string | null {
+  let latest: string | null = null;
+  for (const days of series) {
+    for (const d of days) {
+      if (d.downloads > 0 && (latest === null || d.day > latest)) latest = d.day;
+    }
+  }
+  return latest;
 }
 
 /**

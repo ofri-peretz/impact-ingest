@@ -1,0 +1,74 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Weekly Adopter Scan
+
+# Which public GitHub repos use our packages (scripts/adopters.ts). Weekly:
+# code search allows 10 requests a minute and ~140 queries take ~17 minutes,
+# and GitHub's index lags by days, so daily would add load and no signal.
+# Writes plugin_adopters, plugin_dependents and the github-adopters snapshot.
+
+on:
+  schedule:
+    - cron: "0 6 * * 0" # Sundays 06:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: weekly-adopter-scan
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  scan:
+    name: Scan adopters
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+      - run: npm install --no-audit --no-fund --include=optional
+      - name: Scan adopters
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run adopters
+
+      # Unattended cron — silent failures are dangerous. Auto-open (or
+      # comment on existing) a GitHub issue tagged `ci-failure` so we
+      # get the email notification + a persistent visible record.
+      # cancelled() too: a job timeout is reported as cancelled, not failed.
+      - name: Notify on failure
+        if: failure() || cancelled()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `[CI failure] ${context.workflow} — ${context.ref}`;
+            const body = [
+              `Workflow **${context.workflow}** failed.`,
+              ``,
+              `- Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              `- Trigger: ${context.eventName}`,
+              `- SHA: ${context.sha}`,
+            ].join('\n');
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'ci-failure',
+            });
+            const hit = existing.find(i => i.title === title);
+            if (hit) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: hit.number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ['ci-failure'],
+              });
+            }

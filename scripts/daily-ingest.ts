@@ -18,9 +18,10 @@ import { supabaseAdmin, type Tables } from "./_supabase-admin.js";
 import { collectPaginated, parseRuleCounts } from "./paginate.js";
 import {
   computeNpmDailyRows,
+  latestCollectedDay,
   trailingIdenticalDays,
-  type NpmRangeDay,
 } from "./npm-daily.js";
+import { fetchNpmRanges } from "./npm-range.js";
 import {
   trackedPackages,
   fetchCatalog,
@@ -105,8 +106,8 @@ async function withRetry<T>(
 //     failed to outlast npm's per-IP cool-down anyway, so it burned
 //     runner-seconds without changing the outcome (see PR #36 commit).
 //   - The user's quota-hygiene policy: fail fast, notify, retry tomorrow.
-// The 250ms inter-plugin pacing in the npm loop stays — that's preventive,
-// not reactive, and helps the no-retry policy succeed on the first attempt.
+// The npm range fetch is the exception (npm-range.ts): one bulk call does
+// retry a 429, because losing it loses every package at once.
 
 // npm rate-limits anonymous calls (no User-Agent) far more aggressively
 // than identified ones. Set a real UA to stay on the lower-friction tier.
@@ -142,38 +143,14 @@ async function fetchNpm(pkg: string, period: Period): Promise<number | null> {
 // Override once for a long repair: NPM_BACKFILL_DAYS=130 npm run ingest.
 // The cron was silent 2026-07-19..08-25 and the 30-day window never reached
 // back into it (read 2026-09-04: one to five plugins per day for five weeks).
-const NPM_BACKFILL_DAYS = Number(process.env.NPM_BACKFILL_DAYS) || 30;
+// Capped at 335 so the fetch window stays inside npm's 365-day bulk limit.
+const NPM_BACKFILL_DAYS = Math.min(
+  335,
+  Number(process.env.NPM_BACKFILL_DAYS) || 30,
+);
 // Fetch 30 extra days so the oldest rewritten day still has a full
 // trailing-30 window to sum its d30 from.
 const NPM_FETCH_DAYS = NPM_BACKFILL_DAYS + 30;
-
-// Per-day downloads for one package. The point endpoint ("last-day") answers
-// with the most recent day npm has COLLECTED — not the most recent calendar
-// day — so it cannot say WHICH day its number belongs to without reading the
-// response's start/end, and under a pipeline stall it repeats the same stale
-// answer for days. The range endpoint keys every value by its own day, which
-// is the only honest input for a table keyed by observed_on. Range has no
-// bulk form, so this is one paced call per package.
-async function fetchNpmRange(pkg: string): Promise<NpmRangeDay[] | null> {
-  const end = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
-  const start = new Date(Date.now() - NPM_FETCH_DAYS * 86_400_000)
-    .toISOString()
-    .slice(0, 10);
-  const r = await fetch(
-    `https://api.npmjs.org/downloads/range/${start}:${end}/${encodeURIComponent(pkg)}`,
-    { headers: { "User-Agent": NPM_USER_AGENT, Accept: "application/json" } },
-  );
-  if (!r.ok) {
-    // Same non-fatal contract as fetchNpm: the ratchet is monotonic and the
-    // cron runs daily, so a lost package costs one cosmetic data point.
-    console.error(
-      `[ingest] warn: npm range ${pkg} → ${r.status} (skipped, non-fatal)`,
-    );
-    return null;
-  }
-  const body = (await r.json()) as { downloads?: NpmRangeDay[] };
-  return body.downloads ?? [];
-}
 
 async function ghHeaders(): Promise<Record<string, string>> {
   const h: Record<string, string> = {
@@ -258,34 +235,6 @@ async function fetchGitHubRepoStars(
   }
   const data = (await r.json()) as { stargazers_count: number };
   return data.stargazers_count;
-}
-
-// GitHub Dependents count — how many repos depend on a given npm package name.
-// Uses the GitHub search API with topic/dependency search as a proxy.
-// Not perfectly precise (GitHub's dependency graph is opt-in for private repos),
-// but reliable for public repos and directionally useful as a weekly trend.
-async function fetchGitHubDependents(
-  packageName: string,
-): Promise<number | null> {
-  return withRetry(
-    async () => {
-      // GitHub's dependency graph search: count repos that have the package
-      // in their package.json dependencies via the code search API.
-      const q = `"${packageName}" filename:package.json`;
-      const r = await fetch(
-        `https://api.github.com/search/code?q=${encodeURIComponent(q)}&per_page=1`,
-        { headers: await ghHeaders() },
-      );
-      if (!r.ok) {
-        if (r.status === 422 || r.status === 403) return null; // rate-limit or validation
-        throw new Error(`github-dependents ${packageName} → ${r.status}`);
-      }
-      const d = (await r.json()) as { total_count?: number };
-      return d.total_count ?? null;
-    },
-    `github-dependents ${packageName}`,
-    3,
-  );
 }
 
 // Reddit mention tracker — searches r/javascript, r/node, r/webdev for our
@@ -764,6 +713,21 @@ async function fetchRuleCounts(): Promise<{
 }
 
 async function startRun(): Promise<string> {
+  // A run the runner killed (job timeout, cancel) never reaches endRun, so
+  // its row says "running" forever — 2026-10-14's did. Any row still running
+  // an hour later is dead: close it as an error so the ledger shows it.
+  const { error: staleErr } = await supabaseAdmin
+    .from("ingest_runs")
+    .update({
+      status: "error",
+      finished_at: new Date().toISOString(),
+      error_message: "abandoned: the job ended before the run was closed (timeout or cancel)",
+    })
+    .eq("workflow", "daily-impact-ingest")
+    .eq("status", "running")
+    .lt("started_at", new Date(Date.now() - 3_600_000).toISOString());
+  if (staleErr) throw new Error(`ingest_runs stale close: ${staleErr.message}`);
+
   const { data, error } = await supabaseAdmin
     .from("ingest_runs")
     .insert({
@@ -943,23 +907,44 @@ async function main(): Promise<void> {
     // instead of a wrong one. Re-writing collected days is a no-op — npm
     // does not revise download history — so the upsert stays idempotent.
     //
-    // Request math: range has no bulk form, so this is 1 paced call per
-    // package (36 today) vs the point endpoint's 3 bulk + 12 scoped. The
-    // pre-extraction agents repo ran this exact shape with zero rate-limit
-    // losses; 250ms pacing + the real User-Agent keep it under npm's per-IP
-    // limit.
+    // Request math: one bulk call for every unscoped name plus one per
+    // scoped name (npm-range.ts). The per-package loop this replaced was
+    // 429'd after ~20 calls from 2026-10-06 on and silently lost the rest.
     let dailySum = 0;
     const ruleCounts = await fetchRuleCounts();
     if (ruleCounts === null) degraded.push("rule counts");
 
+    const npmEnd = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+    const npmStart = new Date(Date.now() - NPM_FETCH_DAYS * 86_400_000)
+      .toISOString()
+      .slice(0, 10);
+    const npm = await fetchNpmRanges(
+      (plugins as PluginRow[]).map((p) => p.name),
+      npmStart,
+      npmEnd,
+      NPM_USER_AGENT,
+    );
+    // A package npm did not answer for has NO row today. That is a gap in the
+    // table, so the run is partial — never "success" with rows missing.
+    if (npm.failed.length > 0) {
+      console.error(
+        `::warning::npm downloads unread for ${npm.failed.length} of ${plugins.length} packages: ${npm.failed.join(", ")}`,
+      );
+      degraded.push(
+        `npm downloads (${npm.failed.length}/${plugins.length} packages)`,
+      );
+    }
+
     let latestNpmDay: string | null = null;
-    let pluginIndex = 0;
+    const collectedThrough = latestCollectedDay(npm.byName.values());
     for (const p of plugins as PluginRow[]) {
-      if (pluginIndex > 0) await sleep(250);
-      pluginIndex += 1;
-      const range = await fetchNpmRange(p.name);
-      if (range === null) continue; // fetch failed — already logged, move on
-      const rows = computeNpmDailyRows(range, NPM_BACKFILL_DAYS);
+      const range = npm.byName.get(p.name);
+      if (range === undefined) continue; // in npm.failed — already counted
+      const rows = computeNpmDailyRows(
+        range,
+        NPM_BACKFILL_DAYS,
+        collectedThrough,
+      );
       if (rows.length === 0) {
         console.log(`[npm] ${p.name}  no collected days in window`);
         continue;
@@ -1580,40 +1565,10 @@ async function main(): Promise<void> {
       );
     }
 
-    // GitHub dependents — how many repos depend on our packages.
-    // Rate-limited: only sample the 5 flagship plugins to stay within budget.
-    const flagshipPlugins = (plugins as PluginRow[]).filter((p) =>
-      [
-        "eslint-plugin-secure-coding",
-        "eslint-plugin-node-security",
-        "eslint-plugin-jwt",
-        "eslint-plugin-import-next",
-        "eslint-plugin-maintainability",
-      ].includes(p.name),
-    );
-    for (const p of flagshipPlugins) {
-      await sleep(500); // GitHub search has strict secondary rate limits
-      const count = await fetchGitHubDependents(p.name);
-      if (count !== null) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const { error: depErr } = await (supabaseAdmin as any)
-          .from("plugin_dependents")
-          .upsert(
-            {
-              plugin_id: p.id,
-              observed_on: today,
-              dependent_count: count,
-              ingest_run_id: runId,
-            },
-            { onConflict: "plugin_id,observed_on" },
-          );
-        if (depErr) console.error(`[dependents] ${p.name}: ${depErr.message}`);
-        else {
-          rowsWritten += 1;
-          console.log(`[dependents] ${p.name}=${count}`);
-        }
-      }
-    }
+    // plugin_dependents is written by adopters.ts (weekly): unique external
+    // repos with a verified dependency. The code-search total_count this used
+    // to store counted FILES, so one monorepo's many package.json files read
+    // as many dependents (secure-coding: 22 on 08-18, 140 on 10-16).
 
     // npm version share — latest-version % of d30 for top plugins.
     // Measures upgrade cadence. Only runs for the ecosystem total + top plugin.
