@@ -60,8 +60,10 @@ async function gh(url: string): Promise<Response> {
     Authorization: `Bearer ${TOKEN}`,
   };
   let r = await fetch(url, { headers });
-  if (r.status === 403 || r.status === 429) {
-    // Secondary rate limit: wait what GitHub asks (capped), retry once.
+  // Secondary rate limit: wait what GitHub asks (at least a minute, capped at
+  // 90s) and retry. One retry was not enough for the Actions token: the first
+  // run (2026-10-18) lost 6 of ~140 searches to a second 429.
+  for (let a = 0; a < 4 && (r.status === 403 || r.status === 429); a += 1) {
     const reset = Number(r.headers.get("x-ratelimit-reset")) * 1000 - Date.now();
     const after = Number(r.headers.get("retry-after")) * 1000;
     await sleep(Math.min(90_000, Math.max(after || 0, reset || 0, 60_000)));
