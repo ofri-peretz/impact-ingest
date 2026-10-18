@@ -29,9 +29,11 @@ import { fileURLToPath } from "node:url";
 import { collectPaginated, parseRuleCounts } from "./paginate.js";
 import {
   computeNpmDailyRows,
+  latestCollectedDay,
   trailingIdenticalDays,
   type NpmRangeDay,
 } from "./npm-daily.js";
+import { parseNpmRangeBody, planNpmRangeRequests } from "./npm-range.js";
 
 const DAY_MS = 86_400_000;
 const isoDay = (t: number): string => new Date(t).toISOString().slice(0, 10);
@@ -518,4 +520,71 @@ console.log("daily-ingest.check ✓ npm per-day contract holds");
     "fetchDevtoFollowers must run before ingestDevtoWarehouse spends the dev.to rate limit",
   );
   console.log("✓ devto follower count is read before the warehouse spends the rate limit");
+}
+
+// ── npm range in bulk, and a lost package reaches the run status ─────────────
+// One range call per package was 429'd after ~20 calls from 2026-10-06 on;
+// the rest silently had no row (47 → 21 rows a day) while every run said
+// "success". Unscoped names now share one bulk call; scoped names cannot.
+{
+  const names = [
+    "eslint-plugin-pg",
+    "@interlace/eslint-devkit",
+    "burgee",
+    "@interlace/eslint-formatter",
+  ];
+  const plan = planNpmRangeRequests(names);
+  assert.deepEqual(plan, [
+    ["eslint-plugin-pg", "burgee"],
+    ["@interlace/eslint-devkit"],
+    ["@interlace/eslint-formatter"],
+  ]);
+  assert.equal(
+    planNpmRangeRequests(Array.from({ length: 130 }, (_, i) => `p${i}`)).length,
+    2,
+    "npm takes at most 128 names per bulk call",
+  );
+  assert.deepEqual(plan.flat().sort(), [...names].sort(), "every name requested once");
+
+  const day = { day: "2026-10-16", downloads: 7 };
+  const bulk = parseNpmRangeBody(
+    { "eslint-plugin-pg": { downloads: [day] }, burgee: null },
+    ["eslint-plugin-pg", "burgee"],
+  );
+  assert.deepEqual(bulk.get("eslint-plugin-pg"), [day]);
+  assert.deepEqual(bulk.get("burgee"), [], "npm's null = no downloads, not a failure");
+  const single = parseNpmRangeBody({ package: "burgee", downloads: [day] }, ["burgee"]);
+  assert.deepEqual(single.get("burgee"), [day], "a one-name call has the single shape");
+
+  const here = dirname(fileURLToPath(import.meta.url));
+  const ingest = readFileSync(join(here, "daily-ingest.ts"), "utf-8");
+  assert.match(
+    ingest,
+    /if \(npm\.failed\.length > 0\) \{[\s\S]{0,300}degraded\.push\(/,
+    "a package npm did not answer for must make the run partial",
+  );
+  console.log("✓ npm range: bulk plan, both response shapes, unread packages degrade the run");
+}
+
+// ── A quiet package keeps its real zero days ─────────────────────────────────
+// npm collects a day for every package at once. Judged per package, a package
+// with no downloads on the last few days lost those rows ("maybe not
+// collected"), leaving 43–47 rows a day where 48 packages exist.
+{
+  const busy = series("2026-10-17", 40, () => 50);
+  const quiet = series("2026-10-17", 40, (i) => (i >= 38 ? 0 : 3));
+  const tomorrow = [...busy, { day: "2026-10-18", downloads: 0 }];
+  const through = latestCollectedDay([tomorrow, quiet]);
+  assert.equal(through, "2026-10-17", "last day ANY package has downloads on");
+  const rows = computeNpmDailyRows(quiet, 30, through);
+  assert.equal(rows.length, 30, "quiet package still gets every collected day");
+  assert.equal(rows[rows.length - 1]!.day, "2026-10-17");
+  assert.equal(rows[rows.length - 1]!.d1, 0, "its zero is recorded, not dropped");
+  assert.equal(
+    computeNpmDailyRows(tomorrow, 30, through).at(-1)!.day,
+    "2026-10-17",
+    "npm's zero-padded not-yet-collected day is still dropped",
+  );
+  assert.equal(computeNpmDailyRows(quiet, 30, null).length, 0, "nothing collected → no rows");
+  console.log("✓ npm collected-day is judged across packages; quiet packages keep zero days");
 }

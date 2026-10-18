@@ -39,11 +39,11 @@ jobs:
   ingest:
     name: Ingest into Supabase
     runs-on: ubuntu-latest
-    # Capped at 7 min: last observed successful run was 2m41s. Headroom
-    # for 2-3× plugin-catalog growth before the linear npm loop bites.
-    # If runs creep past 5 min, parallelize the npm loop (chunked
-    # Promise.all w/ concurrency limit) before bumping this cap.
-    timeout-minutes: 7
+    # 12 min. The 7-min cap was hit on 2026-10-14..18 while the all-time step
+    # walked npm one package at a time under 429s; a timeout is reported as
+    # "cancelled", which the failure notice below did not catch, so five days
+    # of lost data raised nothing. Both npm steps now use bulk range calls.
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v6
         with:
@@ -109,8 +109,9 @@ jobs:
       # Unattended cron — silent failures are dangerous. Auto-open (or
       # comment on existing) a GitHub issue tagged `ci-failure` so we
       # get the email notification + a persistent visible record.
+      # cancelled() too: a job timeout is reported as cancelled, not failed.
       - name: Notify on failure
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/github-script@v7
         with:
           script: |

@@ -461,6 +461,59 @@ export type Database = {
           },
         ]
       }
+      // Trimmed to the columns adopters.ts reads and writes; the enrichment
+      // columns (agents repo, enrich-adopters.ts) are left out on purpose.
+      plugin_adopters: {
+        Row: {
+          id: string
+          plugin_name: string
+          repo_full_name: string
+          repo_url: string | null
+          stars: number | null
+          forks: number | null
+          is_fork: boolean | null
+          is_archived: boolean | null
+          last_pushed_at: string | null
+          detected_via: string
+          owner_type: string | null
+          owner_login: string | null
+          first_seen: string
+          last_seen: string
+        }
+        Insert: {
+          id?: string
+          plugin_name: string
+          repo_full_name: string
+          repo_url?: string | null
+          stars?: number | null
+          forks?: number | null
+          is_fork?: boolean | null
+          is_archived?: boolean | null
+          last_pushed_at?: string | null
+          detected_via: string
+          owner_type?: string | null
+          owner_login?: string | null
+          first_seen: string
+          last_seen: string
+        }
+        Update: {
+          id?: string
+          plugin_name?: string
+          repo_full_name?: string
+          repo_url?: string | null
+          stars?: number | null
+          forks?: number | null
+          is_fork?: boolean | null
+          is_archived?: boolean | null
+          last_pushed_at?: string | null
+          detected_via?: string
+          owner_type?: string | null
+          owner_login?: string | null
+          first_seen?: string
+          last_seen?: string
+        }
+        Relationships: []
+      }
       plugin_daily_metrics: {
         Row: {
           github_forks: number | null

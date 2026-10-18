@@ -6,11 +6,10 @@
 //
 //   node --env-file=.env --import tsx scripts/backfill-npm-alltime.ts
 import { supabaseAdmin } from "./_supabase-admin.js";
+import { fetchNpmRanges } from "./npm-range.js";
 
 const UA =
   "ofri-peretz/agents-backfill (https://github.com/ofri-peretz/agents)";
-const sleep = (ms: number): Promise<void> =>
-  new Promise((r) => setTimeout(r, ms));
 const iso = (d: Date): string => d.toISOString().slice(0, 10);
 
 interface AlltimeResult {
@@ -24,59 +23,44 @@ interface AlltimeResult {
   firstDownloadOn: string | null;
 }
 
-async function alltime(pkg: string): Promise<AlltimeResult> {
-  const enc = encodeURIComponent(pkg);
+/**
+ * All-time totals for every name, one bulk range call per 365-day window
+ * (npm's bulk cap) instead of one call per package per window — the per-
+ * package walk took long enough under npm 429s that the job hit its timeout
+ * and was cancelled (2026-10-14..18).
+ *
+ * A package with ANY window unread is returned in `failed` and has no total:
+ * a sum missing a window is an undercount, and upserting it would lower a
+ * published all-time number.
+ */
+async function alltimeAll(
+  names: readonly string[],
+): Promise<{ results: Map<string, AlltimeResult>; failed: Set<string> }> {
   const end = new Date(iso(new Date()));
-  let cursor = new Date("2025-01-01"); // all packages first published Nov/Dec 2025; npm range cap is 18mo
-  let total = 0;
-  let firstDownloadOn: string | null = null;
+  const results = new Map<string, AlltimeResult>(
+    names.map((n) => [n, { total: 0, firstDownloadOn: null }]),
+  );
+  const failed = new Set<string>();
+  // All packages first published Nov/Dec 2025.
+  let cursor = new Date("2025-01-01");
   while (cursor <= end) {
     const we = new Date(cursor);
     we.setFullYear(we.getFullYear() + 1);
     we.setDate(we.getDate() - 1);
     const sliceEnd = we > end ? end : we;
-    const s = iso(cursor);
-    const e = iso(sliceEnd);
-    let ok = false;
-    for (let a = 0; a < 8 && !ok; a += 1) {
-      try {
-        const r = await fetch(
-          `https://api.npmjs.org/downloads/range/${s}:${e}/${enc}`,
-          {
-            headers: { "User-Agent": UA, Accept: "application/json" },
-            signal: AbortSignal.timeout(15_000),
-          },
-        );
-        if (r.ok) {
-          const b = (await r.json()) as {
-            downloads?: Array<{ downloads: number; day: string }>;
-          };
-          const days = b.downloads ?? [];
-          total += days.reduce((x, d) => x + d.downloads, 0);
-          // Windows are walked oldest-first and each is scanned in order, so
-          // the first non-zero day seen is the earliest one overall. Recorded
-          // once and never overwritten.
-          if (firstDownloadOn === null) {
-            firstDownloadOn = days.find((d) => d.downloads > 0)?.day ?? null;
-          }
-          ok = true;
-        } else if (r.status === 404) {
-          ok = true; // package didn't exist in this window
-        } else {
-          await sleep(1000 * 2 ** a); // backoff on 429/5xx
-        }
-      } catch {
-        await sleep(1000 * 2 ** a); // network error (ETIMEDOUT / abort) → retry, don't crash
-      }
+    const window = await fetchNpmRanges(names, iso(cursor), iso(sliceEnd), UA);
+    for (const n of window.failed) failed.add(n);
+    // Windows are walked oldest-first and each is scanned in order, so the
+    // first non-zero day seen is the earliest one overall.
+    for (const [n, days] of window.byName) {
+      const r = results.get(n)!;
+      r.total += days.reduce((x, d) => x + d.downloads, 0);
+      r.firstDownloadOn ??= days.find((d) => d.downloads > 0)?.day ?? null;
     }
-    if (!ok)
-      console.error(
-        `[alltime] ${pkg} window ${s}:${e} failed after retries — skipped`,
-      );
     cursor = new Date(sliceEnd.getTime() + 86_400_000);
-    await sleep(300);
   }
-  return { total, firstDownloadOn };
+  for (const n of failed) results.delete(n);
+  return { results, failed };
 }
 
 async function main(): Promise<void> {
@@ -85,12 +69,14 @@ async function main(): Promise<void> {
     .select("id,name");
   if (error || !plugins) throw new Error(`plugins: ${error?.message}`);
 
+  const { results, failed } = await alltimeAll(plugins.map((p) => p.name));
+
   let eco = 0;
   let ecoSince: string | null = null;
-  for (let i = 0; i < plugins.length; i += 1) {
-    if (i > 0) await sleep(300);
-    const p = plugins[i]!;
-    const { total: t, firstDownloadOn } = await alltime(p.name);
+  for (const p of plugins) {
+    const r = results.get(p.name);
+    if (!r) continue; // unread window: keep yesterday's total, fail below
+    const { total: t, firstDownloadOn } = r;
     eco += t;
     if (firstDownloadOn && (!ecoSince || firstDownloadOn < ecoSince))
       ecoSince = firstDownloadOn;
@@ -109,6 +95,13 @@ async function main(): Promise<void> {
         { onConflict: "plugin_id" },
       );
     if (upErr) throw new Error(`upsert ${p.name}: ${upErr.message}`);
+  }
+  // The ecosystem sum below would be short by every unread package. Fail the
+  // step (the workflow's failure notice fires) instead of publishing it.
+  if (failed.size > 0) {
+    throw new Error(
+      `npm did not answer for ${failed.size} of ${plugins.length} packages (${[...failed].join(", ")}); their totals and the ecosystem total were left as they were`,
+    );
   }
   console.log(
     `[alltime] ecosystem total = ${eco.toLocaleString()} since ${ecoSince ?? "unknown"}`,
