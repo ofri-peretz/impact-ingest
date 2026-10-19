@@ -23,8 +23,8 @@ jobs:
   scan:
     name: Scan adopters
     runs-on: ubuntu-latest
-    # First run took 44 min with 429 waits; retries can add ~6 min per search.
-    timeout-minutes: 90
+    # Runs took 44 and 70 min with 429 waits; a second pass adds a few more.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
         with:
