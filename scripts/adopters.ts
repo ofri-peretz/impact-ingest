@@ -141,79 +141,92 @@ async function main(): Promise<void> {
   const external = new Set<string>();
   console.log(`[adopters] scanning ${packages.length} packages`);
 
-  for (const p of packages) {
-    const found = new Map<string, DetectedVia>();
-    let complete = true;
-    for (const t of TARGETS) {
-      const items = await searchCode(`"${p.name}" filename:${t.filename}`);
-      if (items === null) {
-        complete = false;
-        continue;
-      }
-      for (const it of items) {
-        const repo = it.repository.full_name;
-        // Our own monorepos hold hundreds of matching files; never adopters.
-        if (SELF_OWNERS.has(repo.split("/")[0]!.toLowerCase())) continue;
-        if (found.get(repo) === t.via) continue; // already verified this way
-        const text = await readFile(repo, it.path);
-        if (text === null) continue;
-        const real =
-          t.via === "package.json"
-            ? declaresDependency(text, p.name)
-            : mentionsPackage(text, p.name);
-        if (!real) continue;
-        const prev = found.get(repo);
-        found.set(repo, prev ? strongerVia(prev, t.via) : t.via);
-      }
+  // Packages whose search the token was throttled on get a second pass after
+  // a cool-down: the Actions token is throttled in bursts, so the same query
+  // usually answers a few minutes later (2026-10-18: 6, then 2, of ~140 lost).
+  let todo = packages;
+  for (let pass = 1; pass <= 2 && todo.length > 0; pass += 1) {
+    if (pass > 1) {
+      console.log(`[adopters] second pass for ${todo.length} package(s) after a 3-min cool-down`);
+      await sleep(180_000);
     }
+    const again: typeof packages = [];
+    for (const p of todo) {
+      const found = new Map<string, DetectedVia>();
+      let complete = true;
+      for (const t of TARGETS) {
+        const items = await searchCode(`"${p.name}" filename:${t.filename}`);
+        if (items === null) {
+          complete = false;
+          continue;
+        }
+        for (const it of items) {
+          const repo = it.repository.full_name;
+          // Our own monorepos hold hundreds of matching files; never adopters.
+          if (SELF_OWNERS.has(repo.split("/")[0]!.toLowerCase())) continue;
+          if (found.get(repo) === t.via) continue; // already verified this way
+          const text = await readFile(repo, it.path);
+          if (text === null) continue;
+          const real =
+            t.via === "package.json"
+              ? declaresDependency(text, p.name)
+              : mentionsPackage(text, p.name);
+          if (!real) continue;
+          const prev = found.get(repo);
+          found.set(repo, prev ? strongerVia(prev, t.via) : t.via);
+        }
+      }
 
-    const upserts = [];
-    let count = 0;
-    for (const [repo, via] of found) {
-      const m = await repoMeta(repo);
-      if (!m) continue;
-      upserts.push({
-        plugin_name: p.name,
-        repo_full_name: m.full_name,
-        repo_url: m.html_url,
-        stars: m.stargazers_count,
-        forks: m.forks_count,
-        is_fork: m.fork,
-        is_archived: m.archived,
-        last_pushed_at: m.pushed_at,
-        detected_via: via,
-        owner_type: m.owner.type,
-        owner_login: m.owner.login,
-        first_seen: firstSeen.get(`${p.name}|${m.full_name}`) ?? today,
-        last_seen: today,
-      });
-      if (isExternalActive(m)) {
-        count += 1;
-        external.add(m.full_name);
+      const upserts = [];
+      let count = 0;
+      for (const [repo, via] of found) {
+        const m = await repoMeta(repo);
+        if (!m) continue;
+        upserts.push({
+          plugin_name: p.name,
+          repo_full_name: m.full_name,
+          repo_url: m.html_url,
+          stars: m.stargazers_count,
+          forks: m.forks_count,
+          is_fork: m.fork,
+          is_archived: m.archived,
+          last_pushed_at: m.pushed_at,
+          detected_via: via,
+          owner_type: m.owner.type,
+          owner_login: m.owner.login,
+          first_seen: firstSeen.get(`${p.name}|${m.full_name}`) ?? today,
+          last_seen: today,
+        });
+        if (isExternalActive(m)) {
+          count += 1;
+          external.add(m.full_name);
+        }
+      }
+      console.log(
+        `[adopters] ${p.name}: ${found.size} verified, ${count} external active${complete ? "" : " (INCOMPLETE)"}`,
+      );
+      if (!complete) again.push(p);
+      if (dryRun) continue;
+
+      if (upserts.length > 0) {
+        const { error: upErr } = await supabaseAdmin
+          .from("plugin_adopters")
+          .upsert(upserts, { onConflict: "plugin_name,repo_full_name" });
+        if (upErr) throw new Error(`plugin_adopters ${p.name}: ${upErr.message}`);
+      }
+      if (complete) {
+        const { error: depErr } = await supabaseAdmin
+          .from("plugin_dependents")
+          .upsert(
+            { plugin_id: p.id, observed_on: today, dependent_count: count },
+            { onConflict: "plugin_id,observed_on" },
+          );
+        if (depErr) throw new Error(`plugin_dependents ${p.name}: ${depErr.message}`);
       }
     }
-    console.log(
-      `[adopters] ${p.name}: ${found.size} verified, ${count} external active${complete ? "" : " (INCOMPLETE)"}`,
-    );
-    if (!complete) failed.push(p.name);
-    if (dryRun) continue;
-
-    if (upserts.length > 0) {
-      const { error: upErr } = await supabaseAdmin
-        .from("plugin_adopters")
-        .upsert(upserts, { onConflict: "plugin_name,repo_full_name" });
-      if (upErr) throw new Error(`plugin_adopters ${p.name}: ${upErr.message}`);
-    }
-    if (complete) {
-      const { error: depErr } = await supabaseAdmin
-        .from("plugin_dependents")
-        .upsert(
-          { plugin_id: p.id, observed_on: today, dependent_count: count },
-          { onConflict: "plugin_id,observed_on" },
-        );
-      if (depErr) throw new Error(`plugin_dependents ${p.name}: ${depErr.message}`);
-    }
+    todo = again;
   }
+  failed.push(...todo.map((p) => p.name));
 
   console.log(`[adopters] unique external active repos: ${external.size}`);
   if (failed.length > 0) {
