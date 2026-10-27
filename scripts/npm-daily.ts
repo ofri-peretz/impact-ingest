@@ -23,9 +23,14 @@ export interface NpmRangeDay {
 
 export interface NpmDailyRow {
   day: string;
-  d1: number;
-  d7: number;
-  d30: number;
+  /** null on an npm gap day (see npmGapDays): missing data, not zero. */
+  d1: number | null;
+  /** Raw sums over the window's days WITH data; null when every day is missing. */
+  d7: number | null;
+  d30: number | null;
+  /** Gap days inside each window, so a reader can tell a dip from a hole. */
+  missing_d7: number;
+  missing_d30: number;
 }
 
 const DAY_MS = 86_400_000;
@@ -45,11 +50,14 @@ const isoDay = (t: number): string => new Date(t).toISOString().slice(0, 10);
  *   self-heals.
  * - d7/d30 are trailing sums ending at that day; days before the response's
  *   start count as 0 (same contract as the agents repo's backfill-gaps).
+ * - A day in `gaps` is npm's outage, not ours: d1 is null, it adds nothing to
+ *   d7/d30 and is counted in missing_d7/missing_d30. Never extrapolated.
  */
 export function computeNpmDailyRows(
   days: NpmRangeDay[],
   backfillDays: number,
   collectedThrough?: string | null,
+  gaps: ReadonlySet<string> = new Set(),
 ): NpmDailyRow[] {
   const sorted = [...days].sort((a, b) => a.day.localeCompare(b.day));
   let end = sorted.length;
@@ -66,19 +74,54 @@ export function computeNpmDailyRows(
   const collected = sorted.slice(0, end);
 
   const byDay = new Map(collected.map((d) => [d.day, d.downloads]));
-  const win = (day: string, n: number): number => {
+  const win = (day: string, n: number): [number | null, number] => {
     let s = 0;
+    let missing = 0;
     const t = new Date(day).getTime();
-    for (let k = 0; k < n; k += 1) s += byDay.get(isoDay(t - k * DAY_MS)) ?? 0;
-    return s;
+    for (let k = 0; k < n; k += 1) {
+      const d = isoDay(t - k * DAY_MS);
+      if (gaps.has(d)) missing += 1;
+      else s += byDay.get(d) ?? 0;
+    }
+    return [missing === n ? null : s, missing];
   };
 
-  return collected.slice(-backfillDays).map(({ day, downloads }) => ({
-    day,
-    d1: downloads,
-    d7: win(day, 7),
-    d30: win(day, 30),
-  }));
+  return collected.slice(-backfillDays).map(({ day, downloads }) => {
+    const [d7, missing_d7] = win(day, 7);
+    const [d30, missing_d30] = win(day, 30);
+    return {
+      day,
+      d1: gaps.has(day) ? null : downloads,
+      d7,
+      d30,
+      missing_d7,
+      missing_d30,
+    };
+  });
+}
+
+/**
+ * Days npm reported nothing at all: every tracked package AND `reference`
+ * (a package far too popular to have a real zero day — the ingest uses
+ * `eslint`) read 0. One package's 0 is that package's quiet day; ours all 0
+ * while the reference has downloads is our quiet day. Only days up to
+ * `collectedThrough` qualify — npm's zero-padded tail is "not collected yet",
+ * which computeNpmDailyRows already drops.
+ */
+export function npmGapDays(
+  series: Iterable<NpmRangeDay[]>,
+  reference: NpmRangeDay[],
+  collectedThrough: string | null,
+): Set<string> {
+  const gaps = new Set<string>();
+  if (collectedThrough === null) return gaps;
+  for (const d of reference) {
+    if (d.downloads === 0 && d.day <= collectedThrough) gaps.add(d.day);
+  }
+  for (const days of series) {
+    for (const d of days) if (d.downloads > 0) gaps.delete(d.day);
+  }
+  return gaps;
 }
 
 /**

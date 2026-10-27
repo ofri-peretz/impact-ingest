@@ -30,6 +30,7 @@ import { collectPaginated, parseRuleCounts } from "./paginate.js";
 import {
   computeNpmDailyRows,
   latestCollectedDay,
+  npmGapDays,
   trailingIdenticalDays,
   type NpmRangeDay,
 } from "./npm-daily.js";
@@ -587,4 +588,66 @@ console.log("daily-ingest.check ✓ npm per-day contract holds");
   );
   assert.equal(computeNpmDailyRows(quiet, 30, null).length, 0, "nothing collected → no rows");
   console.log("✓ npm collected-day is judged across packages; quiet packages keep zero days");
+}
+
+// ── npm's empty days are missing data, not zero ──────────────────────────────
+// npm's range API answered 0 for EVERY package on 2026-10-13..15 (and 10-06,
+// 10-19..21, 09-03/07/08/15), `eslint` at ~30M/day included. The ingest stored
+// those as real zeros, so d7 read 42k and the North Star looked like a
+// collapse. A gap is a day where all our packages AND the reference read 0;
+// it is stored as d1 NULL, d7/d30 stay raw sums over the days with data, and
+// the number of missing days rides alongside so a reader can tell.
+{
+  const gapDays = new Set(["2026-10-06", "2026-10-13", "2026-10-14", "2026-10-15"]);
+  const ours = Array.from({ length: 48 }, (_, k) =>
+    series("2026-10-25", 46, (i) => {
+      const day = isoDay(new Date("2026-10-25").getTime() - (45 - i) * DAY_MS);
+      if (gapDays.has(day)) return 0;
+      if (k === 0 && day === "2026-10-08") return 0; // one package's real quiet day
+      if (day === "2026-10-01") return 0; // all ours quiet, eslint not: not a gap
+      return 10 + k;
+    }),
+  );
+  const eslint = [
+    ...series("2026-10-25", 46, (i) => {
+      const day = isoDay(new Date("2026-10-25").getTime() - (45 - i) * DAY_MS);
+      return gapDays.has(day) ? 0 : 30_000_000;
+    }),
+    { day: "2026-10-26", downloads: 0 }, // not collected yet: tail, not a gap
+  ];
+  const through = latestCollectedDay(ours);
+  const gaps = npmGapDays(ours, eslint, through);
+  const rows = computeNpmDailyRows(ours[5]!, 30, through, gaps);
+  const at = (d: string) => rows.find((r) => r.day === d)!;
+
+  for (const d of ["2026-10-13", "2026-10-14", "2026-10-15"]) {
+    assert.equal(at(d).d1, null, `${d} is a gap: d1 must be NULL, not 0`);
+  }
+  // 10-16's window is 10-10..10-16: 10-13/14/15 missing, four days at 15 each.
+  assert.equal(at("2026-10-16").d7, 60, "d7 = raw sum over the 4 days with data");
+  assert.equal(at("2026-10-16").missing_d7, 3, "three of the seven days missing");
+  // 10-25's d30 window (09-26..10-25) holds 10-06, 10-13..15 → 4 missing.
+  assert.equal(at("2026-10-25").missing_d30, 4);
+  assert.equal(at("2026-10-25").d30, (30 - 4 - 1) * 15, "d30 sums days with data (10-01 a real 0)");
+  assert.equal(at("2026-10-01").d1, 0, "all ours 0 but eslint not: a real zero, not a gap");
+  assert.equal(at("2026-10-01").missing_d7, 0);
+
+  assert.deepEqual(
+    [...gaps].filter((d) => d >= "2026-10-01").sort(),
+    [...gapDays].sort(),
+    "gaps = days all packages AND eslint read 0, before the collected tail",
+  );
+  assert.ok(
+    computeNpmDailyRows(ours[0]!, 30, through, gaps).find((r) => r.day === "2026-10-08")!.d1 === 0,
+    "one package's lone 0 is that package's real zero",
+  );
+  assert.ok(!gaps.has("2026-10-26"), "npm's not-yet-collected tail is not a gap");
+
+  // A window with no data at all has no sum to report.
+  const allGap = new Set(Array.from({ length: 7 }, (_, i) => `2026-10-1${i}`));
+  const flat = series("2026-10-20", 40, (i) => (i >= 30 && i <= 36 ? 0 : 5));
+  const r16 = computeNpmDailyRows(flat, 30, "2026-10-20", allGap).find((r) => r.day === "2026-10-16")!;
+  assert.equal(r16.d7, null, "seven missing days → d7 NULL, not 0");
+  assert.equal(r16.missing_d7, 7);
+  console.log("✓ npm gap days are NULL, d7/d30 sum days with data and count the missing");
 }

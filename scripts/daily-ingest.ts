@@ -19,6 +19,7 @@ import { collectPaginated, parseRuleCounts } from "./paginate.js";
 import {
   computeNpmDailyRows,
   latestCollectedDay,
+  npmGapDays,
   trailingIdenticalDays,
 } from "./npm-daily.js";
 import { fetchNpmRanges } from "./npm-range.js";
@@ -148,6 +149,8 @@ const NPM_BACKFILL_DAYS = Math.min(
   335,
   Number(process.env.NPM_BACKFILL_DAYS) || 30,
 );
+// Reference for npm's empty days: ~30M downloads a day, so a 0 is npm's.
+const NPM_GAP_REFERENCE = "eslint";
 // Fetch 30 extra days so the oldest rewritten day still has a full
 // trailing-30 window to sum its d30 from.
 const NPM_FETCH_DAYS = NPM_BACKFILL_DAYS + 30;
@@ -918,8 +921,11 @@ async function main(): Promise<void> {
     const npmStart = new Date(Date.now() - NPM_FETCH_DAYS * 86_400_000)
       .toISOString()
       .slice(0, 10);
+    // `eslint` rides the same bulk call as the reference for npm's empty days:
+    // a day it AND every package of ours read 0 is npm's outage, stored as
+    // NULL. It is read, never upserted (the loop below walks `plugins`).
     const npm = await fetchNpmRanges(
-      (plugins as PluginRow[]).map((p) => p.name),
+      [...(plugins as PluginRow[]).map((p) => p.name), NPM_GAP_REFERENCE],
       npmStart,
       npmEnd,
       NPM_USER_AGENT,
@@ -936,7 +942,20 @@ async function main(): Promise<void> {
     }
 
     let latestNpmDay: string | null = null;
-    const collectedThrough = latestCollectedDay(npm.byName.values());
+    const ours = (plugins as PluginRow[]).flatMap(
+      (p) => npm.byName.get(p.name) ?? [],
+    );
+    const collectedThrough = latestCollectedDay([ours]);
+    const gaps = npmGapDays(
+      [ours],
+      npm.byName.get(NPM_GAP_REFERENCE) ?? [],
+      collectedThrough,
+    );
+    if (gaps.size > 0) {
+      console.log(
+        `[npm] gap days (npm reported 0 for every package and ${NPM_GAP_REFERENCE}): ${[...gaps].sort().join(", ")}`,
+      );
+    }
     for (const p of plugins as PluginRow[]) {
       const range = npm.byName.get(p.name);
       if (range === undefined) continue; // in npm.failed — already counted
@@ -944,6 +963,7 @@ async function main(): Promise<void> {
         range,
         NPM_BACKFILL_DAYS,
         collectedThrough,
+        gaps,
       );
       if (rows.length === 0) {
         console.log(`[npm] ${p.name}  no collected days in window`);
@@ -953,7 +973,7 @@ async function main(): Promise<void> {
       console.log(
         `[npm] ${p.name}  ${rows.length}d → ${last.day}  d1=${last.d1} d7=${last.d7} d30=${last.d30}`,
       );
-      dailySum += last.d1;
+      dailySum += last.d1 ?? 0;
       if (latestNpmDay === null || last.day > latestNpmDay) {
         latestNpmDay = last.day;
       }
@@ -976,6 +996,8 @@ async function main(): Promise<void> {
             npm_downloads_d1: row.d1,
             npm_downloads_d7: row.d7,
             npm_downloads_d30: row.d30,
+            npm_days_missing_d7: row.missing_d7,
+            npm_days_missing_d30: row.missing_d30,
             // Spread, never a bare null: omitting the key leaves whatever a
             // previous run recorded; writing null would erase it.
             ...(ruleCount !== undefined && row.day === newestDay
