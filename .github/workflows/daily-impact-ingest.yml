@@ -25,6 +25,11 @@ on:
   schedule:
     - cron: "0 5 * * *" # 05:00 UTC daily
   workflow_dispatch:
+    inputs:
+      npm_backfill_days:
+        description: "Rewrite this many trailing npm days (default 30, max 335) — for a repair"
+        required: false
+        default: ""
 
 concurrency:
   group: daily-impact-ingest
@@ -73,6 +78,7 @@ jobs:
           # quotes every comment, so only the count crosses over. Unset is
           # stored as a gap, never as a zero.
           DEVTO_COMMENTS_LEFT: ${{ vars.DEVTO_COMMENTS_LEFT }}
+          NPM_BACKFILL_DAYS: ${{ inputs.npm_backfill_days }}
         run: npm run ingest
 
       # Refresh the TRUE all-time npm download total (npm /downloads/range,

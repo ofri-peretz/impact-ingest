@@ -522,6 +522,8 @@ export type Database = {
           ingest_run_id: string | null
           npm_downloads_d1: number | null
           npm_downloads_d30: number | null
+          npm_days_missing_d30: number
+          npm_days_missing_d7: number
           npm_downloads_d7: number | null
           npm_version: string | null
           observed_on: string
@@ -536,6 +538,8 @@ export type Database = {
           ingest_run_id?: string | null
           npm_downloads_d1?: number | null
           npm_downloads_d30?: number | null
+          npm_days_missing_d30?: number
+          npm_days_missing_d7?: number
           npm_downloads_d7?: number | null
           npm_version?: string | null
           observed_on: string
@@ -550,6 +554,8 @@ export type Database = {
           ingest_run_id?: string | null
           npm_downloads_d1?: number | null
           npm_downloads_d30?: number | null
+          npm_days_missing_d30?: number
+          npm_days_missing_d7?: number
           npm_downloads_d7?: number | null
           npm_version?: string | null
           observed_on?: string
@@ -792,6 +798,10 @@ export type Database = {
           name: string | null
           npm_downloads_d1: number | null
           npm_downloads_d30: number | null
+          npm_avg_daily_d30: number | null
+          npm_avg_daily_d7: number | null
+          npm_days_missing_d30: number | null
+          npm_days_missing_d7: number | null
           npm_downloads_d7: number | null
           observed_on: string | null
           plugin_id: number | null
