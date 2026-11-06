@@ -60,13 +60,20 @@ async function gh(url: string): Promise<Response> {
     Authorization: `Bearer ${TOKEN}`,
   };
   let r = await fetch(url, { headers });
-  // Secondary rate limit: wait what GitHub asks (at least a minute, capped at
-  // 90s) and retry. One retry was not enough for the Actions token: the first
-  // run (2026-10-18) lost 6 of ~140 searches to a second 429.
+  // Rate limited: wait what GitHub asks and retry. One retry was not enough
+  // for the Actions token: the first run (2026-10-18) lost 6 of ~140 searches
+  // to a second 429. An explicit retry-after is honoured in full (up to 10
+  // min): the old 90s cap retried inside the penalty window, so a throttled
+  // query burned four retries and ~4.5 min and still failed (2026-10-25 and
+  // 2026-11-01 each lost a dozen packages that way and hit the job timeout).
   for (let a = 0; a < 4 && (r.status === 403 || r.status === 429); a += 1) {
     const reset = Number(r.headers.get("x-ratelimit-reset")) * 1000 - Date.now();
     const after = Number(r.headers.get("retry-after")) * 1000;
-    await sleep(Math.min(90_000, Math.max(after || 0, reset || 0, 60_000)));
+    await sleep(
+      after > 0
+        ? Math.min(600_000, Math.max(after, 1_000))
+        : Math.min(90_000, Math.max(reset || 0, 60_000)),
+    );
     r = await fetch(url, { headers });
   }
   return r;
@@ -87,7 +94,10 @@ async function searchCode(q: string): Promise<CodeItem[] | null> {
       `https://api.github.com/search/code?q=${encodeURIComponent(q)}&per_page=100&page=${page}`,
     );
     if (!r.ok) {
-      console.error(`[adopters] search → ${r.status}`);
+      // Which limit it was decides the fix, and the old log could not tell.
+      console.error(
+        `[adopters] search → ${r.status} retry-after=${r.headers.get("retry-after") ?? "-"} remaining=${r.headers.get("x-ratelimit-remaining") ?? "-"}`,
+      );
       return null;
     }
     const body = (await r.json()) as { items?: CodeItem[] };

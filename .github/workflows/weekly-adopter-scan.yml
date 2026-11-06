@@ -23,8 +23,12 @@ jobs:
   scan:
     name: Scan adopters
     runs-on: ubuntu-latest
-    # Runs took 44 and 70 min with 429 waits; a second pass adds a few more.
-    timeout-minutes: 120
+    # Runs took 44 and 70 min with 429 waits. With 46 packages (~140 queries)
+    # a throttled week hit 120 min before the second pass started, twice
+    # (2026-10-25, 2026-11-01). Per-package rows are written as the scan goes,
+    # so the cost of a timeout is the ecosystem total. Weekly and free on a
+    # public repo: give it most of the 360-min ceiling rather than lose a week.
+    timeout-minutes: 330
     steps:
       - uses: actions/checkout@v6
         with:
