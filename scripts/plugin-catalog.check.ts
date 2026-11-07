@@ -46,6 +46,12 @@ assert.equal(isInterlacePackage("@interlace/devkit"), true);
 
 // 2. Not a plugin — but the predicate must not just answer false to everything.
 assert.equal(isPluginPackage("burgee"), false, "burgee is not a plugin");
+assert.equal(isInterlacePackage("oxlint-plugin-secure-coding"), true, "Oxlint ports are packages we ship");
+assert.equal(isPluginPackage("oxlint-plugin-secure-coding"), false, "an Oxlint port must not double the plugin count");
+assert.equal(isInterlacePackage("oxmutate"), true, "oxmutate is counted");
+assert.equal(isPluginPackage("oxmutate"), false);
+assert.equal(isInterlacePackage("controlroom"), true, "controlroom is counted");
+assert.equal(isInterlacePackage("pennon"), false, "earlier names stay out");
 assert.equal(isPluginPackage("eslint-plugin-anthropic"), true);
 assert.equal(isPluginPackage("@interlace/devkit"), true);
 

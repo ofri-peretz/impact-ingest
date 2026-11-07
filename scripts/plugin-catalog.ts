@@ -121,6 +121,8 @@ export const NON_PLUGIN_PACKAGES: Readonly<Record<string, string>> = {
   bellpull: "cli", // subprocesses with a structured result; 2026-09-09
   closeout: "cli", // exit handlers + terminal restore; 2026-09-09
   paratext: "cli", // OSC: hyperlinks, images, title, clipboard; 2026-09-13
+  controlroom: "cli", // burgee repo; its own site, controlroom.interlace.tools
+  oxmutate: "quality", // mutation testing (test quality); burgee repo, its own product. plugins.category is CHECK-constrained
   // NOT here, on purpose: `pennon`, `answering`, `answerback`. Same repo, but
   // they are earlier names for roundel/caique (same descriptions), published
   // on 2026-09-08 minutes before the final names. Counting them would list one
@@ -136,8 +138,15 @@ export const NON_PLUGIN_PACKAGES: Readonly<Record<string, string>> = {
  * questions with different answers.
  */
 export function isPluginPackage(name: string): boolean {
-  return !(name in NON_PLUGIN_PACKAGES);
+  return !(name in NON_PLUGIN_PACKAGES) && !isOxlintPort(name);
 }
+
+/**
+ * `oxlint-plugin-<x>` is the Oxlint build of `eslint-plugin-<x>`: same rules, a
+ * second package. Its downloads are real adoption and it is a package we ship,
+ * but counting it as a plugin would double the plugin count.
+ */
+export const isOxlintPort = (name: string): boolean => name.startsWith("oxlint-plugin-");
 
 /**
  * Ofri's 2026-06-22 decision (migration 20260622010000): the North Star counts
@@ -152,6 +161,7 @@ export function isInterlacePackage(name: string): boolean {
   return (
     name.startsWith("@interlace/") ||
     name.startsWith("eslint-plugin-") ||
+    isOxlintPort(name) ||
     name in NON_PLUGIN_PACKAGES
   );
 }
@@ -164,6 +174,7 @@ export function isInterlacePackage(name: string): boolean {
 export function deriveCategory(name: string): string {
   const nonPlugin = NON_PLUGIN_PACKAGES[name];
   if (nonPlugin) return nonPlugin; // else `burgee` falls through to "quality"
+  if (isOxlintPort(name)) return deriveCategory(name.replace("oxlint-plugin-", "eslint-plugin-")); // same bucket as its ESLint twin
   if (name.includes("react")) return "react";
   if (/express|nestjs|lambda|serverless/.test(name)) return "framework";
   if (/import-next|devkit|architecture/.test(name)) return "architecture";
